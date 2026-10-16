@@ -1,5 +1,7 @@
 # MyContractApp：Firebase 正式版（可直接部署）
 
+> **使用說明手冊**：[docs/USER_MANUAL.md](docs/USER_MANUAL.md)（[PDF 版](docs/USER_MANUAL.pdf)）
+
 已在 Firebase 官方模擬器驗證：API 流程 **27/27 通過**，瀏覽器單輪實測通過（封面、上傳、翻譯、手寫簽名、一次性連結、進度更新）。
 
 ## 新功能

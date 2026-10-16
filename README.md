@@ -1,5 +1,7 @@
 # MyContractApp 線上簽約（Manus 站 + Firebase 正式後端）
 
+> **使用說明手冊**：[firebase/docs/USER_MANUAL.md](firebase/docs/USER_MANUAL.md)（[PDF 版](firebase/docs/USER_MANUAL.pdf)）
+
 | 頁面 | 說明 |
 |---|---|
 | `public/index.html` + `demo.js` | 示範模式：不連資料庫，兩方／三方一次性簽署連結（localStorage） |
