@@ -110,10 +110,10 @@ if ($who -match 'No authorized accounts' -or $who -notmatch '@') {
 Ok 'logged in'
 
 # ---------------------------------------------------------------- 6. deploy
-Step 6 'Deploying API (Cloud Functions) + website (Hosting) - about 3-6 minutes'
+Step 6 'Deploying API (Cloud Functions) + website (Hosting) + Firestore security rules - about 3-6 minutes'
 Write-Host '  If asked to DELETE other functions, answer N (keeps them).'
-firebase deploy --only "functions,hosting" --project $ProjectId
-if ($LASTEXITCODE -ne 0) { Fail 'firebase deploy (functions,hosting) failed. Copy the red error text above to Manus.' }
+firebase deploy --only "functions,hosting,firestore:rules" --project $ProjectId
+if ($LASTEXITCODE -ne 0) { Fail 'firebase deploy (functions,hosting,firestore:rules) failed. Copy the red error text above to Manus.' }
 Ok 'functions + hosting deployed'
 Write-Host '  Deploying Storage rules (needs Storage enabled in Firebase console)...'
 firebase deploy --only storage --project $ProjectId
@@ -126,7 +126,7 @@ Step 7 'Verifying the live site'
 Start-Sleep -Seconds 5
 try {
   $h = Invoke-RestMethod -Uri "$SiteUrl/api/health" -TimeoutSec 30
-  if ($h.version -eq '2026-10-16') { Ok "API is live: $($h.service) $($h.version)" } else { Write-Host "  WARNING: API answered but version is '$($h.version)'. Wait 1 minute and refresh." -ForegroundColor Yellow }
+  if ($h.version -eq '2026-10-16b') { Ok "API is live: $($h.service) $($h.version)" } else { Write-Host "  WARNING: API answered but version is '$($h.version)'. Wait 1 minute and refresh." -ForegroundColor Yellow }
 } catch { Write-Host "  WARNING: health check failed: $($_.Exception.Message)" -ForegroundColor Yellow }
 
 Write-Host ""

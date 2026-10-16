@@ -101,6 +101,92 @@ check("兩方全數簽署", out[-1].get("status") == "fully_signed", out)
 st = requests.get(API + f"/contracts/status?tenantId={t2}&contractId={c2}", headers=H).json()
 check("簽名圖路徑已記錄", all(v["status"] == "signed" for v in st["invites"]) and st["contract"]["signedCount"] == 2)
 
+# ---- 下載已簽署 PDF
+r = requests.get(API + f"/contracts/signed-pdf?tenantId={t}&contractId={c}", headers=H)
+check("未全數簽署不能下載 PDF", r.status_code == 409 and r.json()["error"] == "contract_not_fully_signed", r.text[:120])
+r = requests.get(API + f"/contracts/signed-pdf?tenantId={t2}&contractId={c2}", headers=H)
+check("建立者下載已簽署 PDF", r.status_code == 200 and r.content[:4] == b"%PDF" and "attachment" in r.headers.get("Content-Disposition", ""), r.status_code)
+open("/tmp/signed_owner.pdf", "wb").write(r.content)
+tk0 = inv[0]["previewUrl"].split("/sign/")[1]
+r = requests.get(API + "/signature/invite", params={"token": tk0})
+check("簽完後再開連結會提示可下載", r.status_code == 409 and r.json().get("signedPdfAvailable") is True, r.text[:160])
+r = requests.get(API + "/signature/signed-pdf", params={"token": tk0})
+check("簽署人用原連結下載 PDF", r.status_code == 200 and r.content[:4] == b"%PDF", r.status_code)
+r = requests.get(API + "/signature/signed-pdf", params={"token": toks[2]})
+check("未簽署的人不能下載", r.status_code == 403, r.status_code)
+check("其他使用者不能下載", requests.get(API + f"/contracts/signed-pdf?tenantId={t2}&contractId={c2}", headers={"Authorization": "Bearer " + tok2}).status_code == 403)
+
+# ---- 中文合約 + 上傳 PDF：產出含原始 PDF 頁面
+import pypdf
+from fpdf import FPDF
+src = FPDF(); src.add_page(); src.set_font("helvetica", size=14); src.cell(0, 10, "ORIGINAL UPLOADED PDF PAGE"); orig = bytes(src.output())
+r = requests.post(API + "/contracts", headers=H, json={"title": "三方採購合約", "summary": "測試中文 PDF。", "body": "第一條　標的。\n第二條　價金。", "coverId": "crimson-seal",
+    "parties": [{"role": "甲方", "email": "p1@example.com"}, {"role": "乙方", "email": "p2@example.com"}, {"role": "丙方", "email": "p3@example.com"}]})
+t3, c3 = r.json()["tenantId"], r.json()["contractId"]
+requests.post(API + "/contracts/document", headers=H, json={"tenantId": t3, "contractId": c3, "fileName": "原始合約.pdf", "contentType": "application/pdf", "dataBase64": base64.b64encode(orig).decode()})
+inv3 = requests.post(API + "/signature/invite", headers=H, json={"tenantId": t3, "contractId": c3, "expiresAt": exp}).json()["invites"]
+for i, v in enumerate(inv3):
+    requests.post(API + "/signature/action", json={"token": v["previewUrl"].split("/sign/")[1], "action": "sign", "name": ["王小明", "李大華", "陳丙"][i], "consent": True, "signatureImage": PNG})
+r = requests.get(API + f"/contracts/signed-pdf?tenantId={t3}&contractId={c3}", headers=H)
+ok3 = r.status_code == 200 and r.content[:4] == b"%PDF"
+if ok3:
+    open("/tmp/signed_zh.pdf", "wb").write(r.content)
+    rd = pypdf.PdfReader(io.BytesIO(r.content)); text = "".join(pg.extract_text() or "" for pg in rd.pages)
+    ok3 = "王小明" in text and "陳丙" in text and "ORIGINAL UPLOADED PDF PAGE" in text and "三方採購合約" in text
+check("中文 PDF 含三方簽名與原始 PDF 頁", ok3, r.status_code)
+r2 = requests.get(API + f"/contracts/signed-pdf?tenantId={t3}&contractId={c3}", headers=H)
+check("再次下載使用快取（內容一致）", r2.content == r.content)
+
+
+# ---- 合約編號 C-YYMM001、可修改、可查詢；瀏覽所有合約；合約內容頁
+import re as _re
+TWN = datetime.now(timezone(timedelta(hours=8))).strftime("%y%m")
+tokN = requests.post(AUTH, json={"returnSecureToken": True}).json()["idToken"]; HN = {"Authorization": "Bearer " + tokN}
+P2 = [{"role": "甲方", "email": "n1@example.com"}, {"role": "乙方", "email": "n2@example.com"}]
+nx = requests.get(API + "/contracts/next-number", headers=HN).json().get("contractNo")
+check("新帳號預設下一號 C-YYMM001", nx == f"C-{TWN}001", nx)
+a = requests.post(API + "/contracts", headers=HN, json={"title": "編號測試 A 採購", "parties": P2}).json()
+b = requests.post(API + "/contracts", headers=HN, json={"title": "編號測試 B 租賃", "parties": P2}).json()
+check("自動編號依序 001、002", a.get("contractNo") == f"C-{TWN}001" and b.get("contractNo") == f"C-{TWN}002", (a.get("contractNo"), b.get("contractNo")))
+cu = requests.post(API + "/contracts", headers=HN, json={"title": "自訂編號合約", "parties": P2, "contractNo": "SAM-2026-01"}).json()
+check("建立時可自訂編號", cu.get("contractNo") == "SAM-2026-01", cu)
+r = requests.post(API + "/contracts", headers=HN, json={"title": "重複", "parties": P2, "contractNo": "sam-2026-01"})
+check("編號不可重複（不分大小寫）", r.status_code == 409 and r.json()["error"] == "contract_no_taken", r.text[:100])
+r = requests.post(API + "/contracts", headers=HN, json={"title": "格式錯", "parties": P2, "contractNo": "含 空白/斜線"})
+check("編號格式錯誤會被拒絕", r.status_code == 400 and r.json()["error"] == "invalid_contract_no", r.text[:100])
+r = requests.post(API + "/contracts", headers=HN, json={"title": "手動輸入下一號", "parties": P2, "contractNo": f"C-{TWN}005"}).json()
+nx2 = requests.get(API + "/contracts/next-number", headers=HN).json().get("contractNo")
+check("手動用了 005，下一個預設跳到 006", nx2 == f"C-{TWN}006", nx2)
+r = requests.post(API + "/contracts/number", headers=HN, json={"contractId": a["contractId"], "contractNo": "PO-0001"})
+check("事後修改編號", r.status_code == 200 and r.json()["contractNo"] == "PO-0001", r.text[:100])
+r = requests.post(API + "/contracts/number", headers=HN, json={"contractId": b["contractId"], "contractNo": "PO-0001"})
+check("修改成已使用的編號會被拒絕", r.status_code == 409, r.status_code)
+c_new = requests.post(API + "/contracts", headers=HN, json={"title": "回收舊號", "parties": P2, "contractNo": f"C-{TWN}001"})
+check("改名後舊編號可再使用", c_new.status_code == 200, c_new.text[:100])
+r = requests.post(API + "/contracts/number", headers={"Authorization": "Bearer " + tok}, json={"contractId": b["contractId"], "contractNo": "HACK-1"})
+check("別人不能改我的編號", r.status_code == 403, r.status_code)
+st = requests.get(API + "/contracts/status", headers=HN, params={"contractNo": "po-0001"})
+check("以合約編號查詢合約內容（不分大小寫）", st.status_code == 200 and st.json()["contract"]["id"] == a["contractId"] and st.json()["contract"]["contractNo"] == "PO-0001", st.text[:120])
+check("查不到的編號回 404", requests.get(API + "/contracts/status", headers=HN, params={"contractNo": "NOPE-9"}).status_code == 404)
+check("別人用編號查不到我的合約", requests.get(API + "/contracts/status", headers={"Authorization": "Bearer " + tok}, params={"contractNo": "PO-0001"}).status_code in (403, 404))
+L = requests.get(API + "/contracts/list", headers=HN).json()
+check("瀏覽所有合約：列出自己的 5 份", L.get("total") == 5 and all(x["contractNo"] for x in L["contracts"]), L.get("total"))
+check("查詢：編號", [x["contractNo"] for x in requests.get(API + "/contracts/list", headers=HN, params={"q": "po-00"}).json()["contracts"]] == ["PO-0001"])
+check("查詢：名稱關鍵字", [x["title"] for x in requests.get(API + "/contracts/list", headers=HN, params={"q": "租賃"}).json()["contracts"]] == ["編號測試 B 租賃"])
+check("查詢：簽署方 Email", requests.get(API + "/contracts/list", headers=HN, params={"q": "n2@example"}).json()["total"] == 5)
+check("篩選：狀態", requests.get(API + "/contracts/list", headers=HN, params={"status": "fully_signed"}).json()["total"] == 0)
+check("別人的清單看不到我的合約", all(x["id"] not in (a["contractId"], b["contractId"]) for x in requests.get(API + "/contracts/list", headers={"Authorization": "Bearer " + tok}).json()["contracts"]))
+check("未登入不能瀏覽", requests.get(API + "/contracts/list").status_code == 401)
+requests.post(API + "/signature/invite", headers=HN, json={"tenantId": L["tenantId"], "contractId": a["contractId"], "expiresAt": exp})
+st = requests.get(API + "/contracts/status", headers=HN, params={"contractNo": "PO-0001"}).json()
+check("合約內容頁可找回待簽連結（換頁、清快取也不會遺失）", all(v.get("link", "").startswith(BASE + "/sign/") or "/sign/" in (v.get("link") or "") for v in st["invites"]), [v.get("link") for v in st["invites"]][:1])
+from urllib.parse import unquote as _uq
+_cd = _uq(requests.get(API + f"/contracts/signed-pdf?tenantId={t3}&contractId={c3}", headers=H).headers.get("Content-Disposition", ""))
+_no3 = requests.get(API + "/contracts/status", headers=H, params={"tenantId": t3, "contractId": c3}).json()["contract"]["contractNo"]
+check("PDF 檔名使用合約編號", _no3.startswith("C-") and _no3 in _cd, (_no3, _cd[:80]))
+for path in ["/contracts", "/contracts/PO-0001"]:
+    r = requests.get(BASE + path)
+    check(f"網頁 {path} 可開啟", r.status_code == 200 and 'id="list-page"' in r.text, r.status_code)
 ok = sum(1 for _, p in results if p)
 print(f"\n結果：{ok}/{len(results)} 通過")
 sys.exit(0 if ok == len(results) else 1)

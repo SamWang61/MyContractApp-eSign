@@ -31,7 +31,7 @@ const ERR = {
   translation_api_not_enabled: '英文翻譯尚未啟用：請在 Google Cloud 啟用「Cloud Translation API」。',
   unsupported_language: '不支援的語言。', invite_not_found: '找不到這份簽署邀請，請確認連結是否完整。',
   invite_already_consumed: '此連結已使用過，不能重複操作。', invite_not_pending: '此邀請目前無法簽署。',
-  invite_expired: '此連結已逾期，請向合約管理者重新索取。', contract_closed: '此合約已被拒絕、退回或已完成，無法再簽署。',
+  invite_expired: '此連結已逾期，請向合約管理者重新索取。', contract_closed: '此合約已被拒絕、退回或已完成，無法再簽署。', contract_not_fully_signed: '所有簽署方完成後才能下載已簽署 PDF。', invalid_contract_no: '合約編號格式不正確：2–40 個字元，只能用英數字、減號、底線、點，且以英數字開頭。', contract_no_taken: '這個合約編號已被使用，請換一個。', contract_not_found: '找不到這份合約（請確認合約編號，或是否用建立合約的同一個瀏覽器開啟）。', signer_only: '只有已簽署的簽署人可以下載。',
   name_and_consent_required: '請填寫姓名並勾選電子簽署同意。', reason_required: '退回或拒絕時請填寫原因。',
   signature_required: '請在簽名欄手寫簽名。', token_required: '連結缺少簽署 Token。', document_not_found: '這份合約沒有上傳文件。'
 };
@@ -70,7 +70,7 @@ function coverHtml(c, lang = 'zh-TW', fields = null) {
     <div class="c-title">${esc(f.title || c.title)}</div>
     <div class="c-sum">${esc(f.summary || '')}</div>
     <div class="c-parties"><b>${u.parties}</b>${parties}</div>
-    <div class="c-foot"><span>${u.id} ${esc(c.id || '—')}</span><span>${u.date} ${esc((c.createdAt || new Date().toISOString()).slice(0, 10))}</span></div>
+    <div class="c-foot"><span>${u.id} ${esc(c.contractNo || c.id || '—')}</span><span>${u.date} ${esc((c.createdAt || new Date().toISOString()).slice(0, 10))}</span></div>
   </div>`;
 }
 function contentHtml(c, lang, fields, docBtnId) {
@@ -87,6 +87,17 @@ async function openBlob(path, token) {
   if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || `HTTP ${res.status}`); }
   const url = URL.createObjectURL(await res.blob());
   window.open(url, '_blank', 'noopener');
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+async function downloadFile(path, token, fallbackName) {
+  const res = await fetch(API + path, { headers: token ? { Authorization: 'Bearer ' + token } : {} });
+  if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || `HTTP ${res.status}`); }
+  const cd = res.headers.get('Content-Disposition') || '';
+  const m = cd.match(/filename\*=UTF-8''([^;]+)/);
+  const name = m ? decodeURIComponent(m[1]) : fallbackName;
+  const url = URL.createObjectURL(await res.blob());
+  const a = Object.assign(document.createElement('a'), { href: url, download: name });
+  document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 function langTabs(el, current, onPick) {
@@ -115,7 +126,18 @@ async function initSigning() {
   cv.addEventListener('touchstart', start, { passive: false }); cv.addEventListener('touchmove', move, { passive: false }); cv.addEventListener('touchend', () => (drawing = false));
   $('sig-clear').onclick = () => { ctx.clearRect(0, 0, cv.width, cv.height); drawn = false; };
 
-  const fail = (e) => { $('sign-title').textContent = '簽署邀請無效'; $('sign-view').hidden = true; $('sign-state').innerHTML = `<div class="bad">${esc(errText(e))}</div>`; };
+  const pdfBtn = () => '<div class="row-btns"><button id="dl-signed" type="button">下載已簽署 PDF</button></div>';
+  const bindPdf = () => { if ($('dl-signed')) $('dl-signed').onclick = () => downloadFile('/signature/signed-pdf?token=' + encodeURIComponent(token), null, 'signed-contract.pdf').catch((e) => toast(errText(e))); };
+  const fail = (e) => {
+    $('sign-view').hidden = true;
+    if (e.data?.signedPdfAvailable) {
+      $('sign-title').textContent = '合約已全數簽署完成';
+      $('sign-state').innerHTML = `<div class="done">所有簽署方皆已完成簽署，您可以下載已簽署的 PDF 合約。</div>${pdfBtn()}`;
+      bindPdf(); return;
+    }
+    $('sign-title').textContent = '簽署邀請無效';
+    $('sign-state').innerHTML = `<div class="bad">${esc(errText(e))}</div>`;
+  };
 
   async function load(pick) {
     try {
@@ -159,7 +181,9 @@ async function initSigning() {
       const r = await call('/signature/action', { method: 'POST', body });
       const done = { signed: '已完成電子簽署', declined: '已拒絕簽署', changes_requested: '已退回修改' }[r.inviteStatus] || '已完成';
       $('sign-form').hidden = true;
-      $('sign-state').innerHTML = `<div class="done"><b>${done}</b>。合約狀態：${esc(CONTRACT_TEXT[r.status] || r.status)}。<br>此連結已失效，不能重複操作。感謝您的配合。</div>`;
+      const full = r.status === 'fully_signed';
+      $('sign-state').innerHTML = `<div class="done"><b>${done}</b>。合約狀態：${esc(CONTRACT_TEXT[r.status] || r.status)}。<br>${full ? '所有簽署方皆已完成，可下載已簽署 PDF；之後再開此連結也能下載。' : '此連結已不能再簽署；全部簽署方完成後，再開此連結即可下載已簽署 PDF。'}</div>${full ? pdfBtn() : ''}`;
+      bindPdf();
       out.textContent = '';
     } catch (e) {
       out.className = 'error';
@@ -193,7 +217,7 @@ function patchHistory(contractId, patch) {
 function renderHistory() {
   const list = loadHistory();
   $('history-card').hidden = !list.length;
-  $('history').innerHTML = list.map((h) => `<div class="history-row"><span>${esc(h.title)}｜${h.parties} 方｜${fmtDate(h.at)}</span> <button class="secondary" data-id="${esc(h.contractId)}">查看</button></div>`).join('');
+  $('history').innerHTML = list.map((h) => `<div class="history-row"><span>${esc(h.contractNo || '')} ${esc(h.title)}｜${h.parties} 方｜${fmtDate(h.at)}</span> <button class="secondary" data-id="${esc(h.contractId)}">查看</button> <a class="btn secondary" href="/contracts/${encodeURIComponent(h.contractNo || h.contractId)}">合約內容頁</a></div>`).join('');
   $('history').querySelectorAll('button').forEach((b) => (b.onclick = () => openContract(b.dataset.id)));
 }
 
@@ -230,13 +254,14 @@ async function createContract() {
     msg.textContent = '建立合約中…';
     const r = await call('/contracts', { method: 'POST', token, body: {
       title, summary: $('c-summary').value.trim(), body: $('c-body').value.trim(), language: $('c-lang').value,
-      coverId: cover, parties: roles.map((role, i) => ({ role, email: emails[i] }))
+      coverId: cover, parties: roles.map((role, i) => ({ role, email: emails[i] })), contractNo: $('c-no').value.trim()
     } });
     if (file) {
       msg.textContent = `上傳文件 ${file.name}…`;
       await call('/contracts/document', { method: 'POST', token, body: { tenantId: r.tenantId, contractId: r.contractId, fileName: file.name, contentType: file.type, dataBase64: await fileB64(file) } });
     }
-    saveHistory({ tenantId: r.tenantId, contractId: r.contractId, title, parties: emails.length, at: Date.now(), links: {}, days: Number($('c-days').value) || 7 });
+    fillNextNumber();
+    saveHistory({ tenantId: r.tenantId, contractId: r.contractId, contractNo: r.contractNo, title, parties: emails.length, at: Date.now(), links: {}, days: Number($('c-days').value) || 7 });
     msg.textContent = '';
     await openContract(r.contractId);
     $('preview-card').scrollIntoView({ behavior: 'smooth' });
@@ -292,8 +317,11 @@ async function sendInvites() {
     r.invites.forEach((v) => { if (v.previewUrl) links[v.signerId] = v.previewUrl; });
     patchHistory(current.contractId, { links });
     const mailed = r.invites.filter((v) => v.emailStatus === 'sent').length;
-    msg.className = 'muted';
-    msg.textContent = mailed ? `已寄出 ${mailed} 封簽署邀請 Email。` : `已產生 ${r.invites.length} 條一次性簽署連結（未設定寄信服務，請複製連結傳給對方）。`;
+    const failed = r.invites.filter((v) => v.emailStatus === 'failed').length;
+    msg.className = failed ? 'error' : 'muted';
+    msg.textContent = mailed || failed
+      ? `已寄出 ${mailed} 封簽署邀請 Email${failed ? `，${failed} 封寄送失敗（請複製連結自行轉交，並檢查 SMTP 設定）` : ''}。`
+      : `已產生 ${r.invites.length} 條一次性簽署連結（未設定寄信服務，請複製連結傳給對方）。`;
     $('send-btn').hidden = true;
     await openContract(current.contractId);
   } catch (e) {
@@ -307,7 +335,7 @@ function renderTracking(data) {
   const c = data.contract;
   const h = loadHistory().find((x) => x.contractId === c.id) || { links: {} };
   $('track-card').hidden = false;
-  $('track-title').textContent = `簽署進度｜${c.title}`;
+  $('track-title').textContent = `簽署進度｜${c.contractNo || ''} ${c.title}`;
   $('contract-status').className = 'status ' + c.status;
   $('contract-status').textContent = CONTRACT_TEXT[c.status] || c.status;
   const total = data.invites.length;
@@ -315,16 +343,17 @@ function renderTracking(data) {
     : c.status === 'declined' ? '有簽署方拒絕簽署，合約已鎖定。'
     : c.status === 'changes_requested' ? '有簽署方要求退回修改，合約已鎖定，請修改後重新建立。'
     : '等待其他簽署方完成（每 5 秒自動更新）。';
-  $('contract-state').textContent = `${total} 方簽署｜已簽 ${c.signedCount}/${total}｜${tail}`;
+  $('contract-state').innerHTML = `${esc(`${total} 方簽署｜已簽 ${c.signedCount}/${total}｜${tail}`)}${c.status === 'fully_signed' ? '<div class="row-btns"><button id="owner-dl" type="button">下載已簽署 PDF</button></div>' : ''}`;
+  if ($('owner-dl')) $('owner-dl').onclick = () => idToken().then((t) => downloadFile(`/contracts/signed-pdf?tenantId=${encodeURIComponent(current.tenantId)}&contractId=${encodeURIComponent(c.id)}`, t, 'signed-contract.pdf')).catch((e) => toast(errText(e)));
   $('parties').innerHTML = data.invites.map((v) => {
-    const url = h.links?.[v.signerId];
+    const url = v.link || h.links?.[v.signerId];
     const link = v.status === 'pending'
       ? (url ? `<div class="link-box">${esc(url)}</div><div class="row-btns"><a class="btn" href="${esc(url)}" target="_blank" rel="noopener">開啟簽署頁</a><button class="secondary" data-copy="${esc(url)}">複製連結</button></div>`
              : `<p class="muted">${v.emailStatus === 'sent' ? '已寄出 Email 邀請。' : '連結只保存在建立合約的瀏覽器。'}</p>`)
       : '';
     const d = v.decision ? `<p class="muted">${esc(v.decision.name || '')}${v.decision.reason ? '｜原因：' + esc(v.decision.reason) : ''}｜${fmtDate(v.decision.at)}</p>` : '';
     return `<div class="card party"><div class="party-head"><span class="role">${esc(v.role)}</span><span class="status ${esc(v.status)}">${esc(INVITE_TEXT[v.status] || v.status)}</span></div>
-      <p class="muted">${esc(v.email)}｜期限 ${fmtDate(v.expiresAt)}</p>${d}${link}</div>`;
+      <p class="muted">${esc(v.email)}｜期限 ${fmtDate(v.expiresAt)}｜Email：${({ sent: '已寄出', failed: '寄送失敗', preview: '未寄信（手動轉交）' })[v.emailStatus] || '—'}</p>${d}${link}</div>`;
   }).join('');
   $('parties').querySelectorAll('[data-copy]').forEach((b) => (b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); toast('已複製簽署連結'); } catch { prompt('請手動複製連結', b.dataset.copy); } }));
 }
@@ -351,12 +380,143 @@ function initManager() {
   $('create-btn').onclick = createContract;
   $('send-btn').onclick = sendInvites;
   $('create-btn').disabled = true;
-  const auth = getAuth(initializeApp(FIREBASE_CONFIG));
-  if (LOCAL) connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
-  onAuthStateChanged(auth, (u) => {
-    if (u) { user = u; $('conn-badge').textContent = '已登入（匿名）'; $('create-btn').disabled = false; renderHistory(); }
-  });
-  signInAnonymously(auth).catch((e) => { $('conn-badge').textContent = '登入失敗'; $('create-msg').textContent = '無法登入 Firebase：' + (e.code || e.message); });
+  startAuth(() => { $('create-btn').disabled = false; renderHistory(); fillNextNumber(); }, (e) => { $('create-msg').textContent = '無法登入 Firebase：' + (e.code || e.message); });
 }
 
-if (signToken) initSigning(); else initManager();
+/* 匿名登入（同一瀏覽器會保留同一個身分，看到的就是這個身分建立的合約） */
+function startAuth(onReady, onFail) {
+  const auth = getAuth(initializeApp(FIREBASE_CONFIG));
+  if (LOCAL) connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
+  let done = false;
+  onAuthStateChanged(auth, (u) => {
+    if (u && !done) { done = true; user = u; $('conn-badge').textContent = '已登入（匿名）'; onReady(); }
+  });
+  signInAnonymously(auth).catch((e) => { $('conn-badge').textContent = '登入失敗'; onFail?.(e); });
+}
+async function fillNextNumber() {
+  try {
+    const r = await call('/contracts/next-number', { token: await idToken() });
+    const el = $('c-no');
+    if (!el.value || el.dataset.auto === el.value) { el.value = r.contractNo; el.dataset.auto = r.contractNo; }
+  } catch { /* 留白則由後端自動編號 */ }
+}
+function showNav(which) {
+  $('top-nav').hidden = false;
+  document.querySelectorAll('#top-nav a').forEach((a) => a.classList.toggle('on', a.dataset.nav === which));
+}
+
+/* =========================== 瀏覽所有合約 =========================== */
+const SWATCH = { 'classic-navy': '#0f1f3d', 'business-gold': '#b8913a', 'minimal-white': '#e2e8f0', 'tech-blue': '#1e3a8a', 'jade-green': '#1f3d2b', 'crimson-seal': '#b42318' };
+let listTimer = null;
+async function loadList() {
+  const q = $('q').value.trim();
+  const st = $('q-status').value;
+  const url = new URL(location.href);
+  if (q) url.searchParams.set('q', q); else url.searchParams.delete('q');
+  if (st) url.searchParams.set('status', st); else url.searchParams.delete('status');
+  history.replaceState(null, '', url.pathname + url.search);
+  $('list-body').innerHTML = '<p class="muted">查詢中…</p>';
+  try {
+    const r = await call(`/contracts/list?q=${encodeURIComponent(q)}&status=${encodeURIComponent(st)}`, { token: await idToken() });
+    $('list-count').textContent = `共 ${r.total} 份`;
+    $('list-body').innerHTML = r.contracts.length ? r.contracts.map((c) => `<a class="c-row" href="/contracts/${encodeURIComponent(c.contractNo)}">
+        <div class="no">${esc(c.contractNo)}</div>
+        <div><div class="t"><span class="swatch" style="background:${SWATCH[c.coverId] || '#0f1f3d'}"></span>${esc(c.title)}</div>
+          <div class="sub">${c.parties.map((p) => `${esc(p.role)} ${esc(p.email)}`).join('｜')}${c.hasDocument ? '｜附件' : ''}</div></div>
+        <div class="sub">建立 ${fmtDate(c.createdAt)}</div>
+        <div><span class="status ${esc(c.status)}">${esc(CONTRACT_TEXT[c.status] || c.status)}</span><div class="sub">已簽 ${c.signedCount}/${c.partyCount}</div></div>
+      </a>`).join('') : `<p class="muted">${q || st ? '沒有符合條件的合約。' : '還沒有合約，請到「建立合約」新增。'}</p>`;
+  } catch (e) {
+    $('list-body').innerHTML = `<p class="error">${esc(errText(e))}</p>`;
+  }
+}
+function initList() {
+  $('list-page').hidden = false;
+  showNav('list');
+  const params = new URLSearchParams(location.search);
+  $('q').value = params.get('q') || '';
+  $('q-status').value = params.get('status') || '';
+  $('q').addEventListener('input', () => { clearTimeout(listTimer); listTimer = setTimeout(loadList, 350); });
+  $('q-status').addEventListener('change', loadList);
+  startAuth(loadList, (e) => { $('list-body').innerHTML = `<p class="error">無法登入 Firebase：${esc(e.code || e.message)}</p>`; });
+}
+
+/* =========================== 合約內容頁 =========================== */
+let detail = null; // { tenantId, contract, invites }
+async function detailLang(lang) {
+  const c = detail.contract;
+  langTabs($('d-lang'), lang, detailLang);
+  let fields = null;
+  if (lang !== (c.language || 'zh-TW')) {
+    $('d-content').innerHTML = '<p class="muted">翻譯中…</p>';
+    try {
+      fields = (await call('/contracts/translate', { method: 'POST', token: await idToken(), body: { tenantId: detail.tenantId, contractId: c.id, lang } })).fields;
+    } catch (e) { toast(errText(e)); return detailLang(c.language || 'zh-TW'); }
+  }
+  $('d-content').innerHTML = contentHtml(c, lang, fields, 'd-doc');
+  if ($('d-doc')) $('d-doc').onclick = () => idToken().then((t) => openBlob(`/contracts/document?tenantId=${encodeURIComponent(detail.tenantId)}&contractId=${encodeURIComponent(c.id)}`, t)).catch((e) => toast(errText(e)));
+}
+function renderDetail() {
+  const { contract: c, invites } = detail;
+  document.title = `${c.contractNo}｜${c.title}`;
+  $('d-no-label').textContent = c.contractNo;
+  $('d-title').textContent = c.title;
+  $('d-status').className = 'status ' + c.status;
+  $('d-status').textContent = CONTRACT_TEXT[c.status] || c.status;
+  $('d-no').value = c.contractNo;
+  $('d-msg').className = 'muted';
+  $('d-msg').textContent = `內部 ID ${c.id}｜建立 ${fmtDate(c.createdAt)}｜${invites.length ? `已簽 ${c.signedCount}/${invites.length}` : '尚未發出簽署邀請'}`;
+  $('d-actions').innerHTML = (c.status === 'fully_signed' ? '<button id="d-pdf" type="button">下載已簽署 PDF</button>' : '')
+    + (c.status === 'draft' ? '<span class="muted">此合約尚未發出邀請：請到「建立合約」頁的歷史紀錄開啟並發送。</span>' : '');
+  if ($('d-pdf')) $('d-pdf').onclick = () => idToken().then((t) => downloadFile(`/contracts/signed-pdf?tenantId=${encodeURIComponent(detail.tenantId)}&contractId=${encodeURIComponent(c.id)}`, t, `${c.contractNo}.pdf`)).catch((e) => toast(errText(e)));
+  $('d-parties').innerHTML = invites.length ? invites.map((v) => {
+    const d = v.decision ? `<p class="muted">${esc(v.decision.name || '')}${v.decision.reason ? '｜原因：' + esc(v.decision.reason) : ''}｜${fmtDate(v.decision.at)}</p>` : '';
+    const link = v.link ? `<div class="link-box">${esc(v.link)}</div><div class="row-btns"><button class="secondary" data-copy="${esc(v.link)}">複製簽署連結</button></div>` : '';
+    return `<div class="card party"><div class="party-head"><span class="role">${esc(v.role)}</span><span class="status ${esc(v.status)}">${esc(INVITE_TEXT[v.status] || v.status)}</span></div>
+      <p class="muted">${esc(v.email)}｜期限 ${fmtDate(v.expiresAt)}</p>${d}${link}</div>`;
+  }).join('') : (c.parties || []).map((p) => `<div class="card party"><div class="party-head"><span class="role">${esc(p.role)}</span><span class="status draft">未發邀請</span></div><p class="muted">${esc(p.email)}</p></div>`).join('');
+  $('d-parties').querySelectorAll('[data-copy]').forEach((b) => (b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); toast('已複製簽署連結'); } catch { prompt('請手動複製連結', b.dataset.copy); } }));
+}
+async function loadDetail(key) {
+  const token = await idToken();
+  let r;
+  try {
+    r = await call(`/contracts/status?contractNo=${encodeURIComponent(key)}`, { token });
+  } catch (e) {
+    if (e.status !== 404) throw e;
+    r = await call(`/contracts/status?contractId=${encodeURIComponent(key)}`, { token }); // 舊合約沒有編號時用內部 ID
+  }
+  detail = { tenantId: r.contract.tenantId, contract: r.contract, invites: r.invites };
+  renderDetail();
+  await detailLang(r.contract.language || 'zh-TW');
+}
+async function saveNumber() {
+  const no = $('d-no').value.trim();
+  if (!no || no === detail.contract.contractNo) return;
+  $('d-no-save').disabled = true;
+  try {
+    const r = await call('/contracts/number', { method: 'POST', token: await idToken(), body: { contractId: detail.contract.id, contractNo: no } });
+    detail.contract.contractNo = r.contractNo;
+    patchHistory(detail.contract.id, { contractNo: r.contractNo });
+    history.replaceState(null, '', '/contracts/' + encodeURIComponent(r.contractNo));
+    renderDetail();
+    await detailLang(detail.contract.language || 'zh-TW');
+    toast('合約編號已更新');
+  } catch (e) {
+    $('d-msg').className = 'error'; $('d-msg').textContent = errText(e);
+  } finally { $('d-no-save').disabled = false; }
+}
+function initDetail(key) {
+  $('detail-page').hidden = false;
+  showNav('list');
+  $('d-no-save').onclick = saveNumber;
+  startAuth(() => loadDetail(key).catch((e) => { $('d-title').textContent = '無法開啟合約'; $('d-msg').className = 'error'; $('d-msg').textContent = errText(e); }),
+    (e) => { $('d-msg').textContent = '無法登入 Firebase：' + (e.code || e.message); });
+}
+
+const listRoute = /^\/contracts\/?$/.test(location.pathname);
+const detailKey = (location.pathname.match(/^\/contracts\/([^/]+)\/?$/) || [])[1];
+if (signToken) initSigning();
+else if (detailKey) initDetail(decodeURIComponent(detailKey));
+else if (listRoute) initList();
+else { showNav('new'); initManager(); }

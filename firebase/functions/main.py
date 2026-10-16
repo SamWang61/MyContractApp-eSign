@@ -20,6 +20,7 @@ from email.message import EmailMessage
 import base64
 import hashlib
 import os
+import re
 import secrets
 import smtplib
 from typing import Any
@@ -29,6 +30,7 @@ from firebase_admin import auth, firestore, initialize_app, storage
 from firebase_functions import https_fn, options
 
 from documents import decode_signature, decode_upload, extract_text
+from pdf_export import build_signed_pdf, digest
 from signature_service import contract_closed, issue_token, next_contract_status, token_digest, validate_action
 from translation import SUPPORTED, translate_fields
 
@@ -108,6 +110,68 @@ def owned_contract(user: dict, tenant_id: str, contract_id: str):
     return snap
 
 
+NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,39}$")
+TW_TZ = timezone(timedelta(hours=8))
+
+
+def number_key(no: str) -> str:
+    return no.strip().upper()
+
+
+def clean_number(no: Any) -> str:
+    no = str(no or "").strip()
+    if not NO_RE.match(no):
+        raise ValueError("invalid_contract_no")
+    return no
+
+
+def month_prefix() -> str:
+    return "C-" + datetime.now(TW_TZ).strftime("%y%m")
+
+
+def peek_next_number(tref) -> str:
+    """預設編號 C-YYMM001 起跳，每月重新計數；已被使用（含手動輸入）的號碼自動跳過。"""
+    prefix = month_prefix()
+    n = int(((tref.collection("counters").document(prefix).get().to_dict()) or {}).get("value", 0))
+    while True:
+        n += 1
+        cand = f"{prefix}{n:03d}"
+        if not tref.collection("contractNumbers").document(number_key(cand)).get().exists:
+            return cand
+
+
+def reserve_number(tref, no: str, contract_id: str, release: str | None = None) -> None:
+    """在交易中保留編號（同一工作區不可重複），必要時釋放舊編號，並推進當月計數。"""
+    key_ref = tref.collection("contractNumbers").document(number_key(no))
+    prefix = month_prefix()
+    counter_ref = tref.collection("counters").document(prefix)
+
+    @firestore.transactional
+    def run(tx):
+        taken = tx_get(tx, key_ref)
+        if taken and taken.get("contractId") != contract_id:
+            raise ValueError("contract_no_taken")
+        counter = int(tx_get(tx, counter_ref).get("value", 0))
+        m = re.fullmatch(re.escape(prefix) + r"(\d{3,})", number_key(no))
+        tx.set(key_ref, {"contractId": contract_id, "contractNo": no, "at": firestore.SERVER_TIMESTAMP})
+        if m and int(m.group(1)) > counter:
+            tx.set(counter_ref, {"value": int(m.group(1))})
+        if release and number_key(release) != number_key(no):
+            tx.delete(tref.collection("contractNumbers").document(number_key(release)))
+
+    run(DB.transaction())
+
+
+def resolve_contract(user: dict, tenant_id: str, contract_id: str = "", contract_no: str = ""):
+    """以內部 ID 或合約編號找到自己的合約。"""
+    if not contract_id and contract_no:
+        hit = DB.collection("tenants").document(tenant_id).collection("contractNumbers").document(number_key(contract_no)).get()
+        if not hit.exists:
+            raise LookupError("contract_not_found")
+        contract_id = (hit.to_dict() or {}).get("contractId", "")
+    return owned_contract(user, tenant_id, contract_id)
+
+
 def tx_get(transaction, ref) -> dict:
     """相容新舊版 google-cloud-firestore：transaction.get 可能回傳快照或產生器。"""
     result = transaction.get(ref)
@@ -126,20 +190,30 @@ def find_invite(raw: str):
 
 
 def send_email(to: str, subject: str, text: str) -> str:
+    """回傳 sent / preview（未設定 SMTP）/ failed（SMTP 錯誤，不中斷流程）。"""
     host = os.getenv("SMTP_HOST")
     if not host:
         return "preview"
+    port = int(os.getenv("SMTP_PORT", "587"))
     message = EmailMessage()
-    message["From"] = os.getenv("SMTP_FROM", "no-reply@example.com")
+    message["From"] = os.getenv("SMTP_FROM") or os.getenv("SMTP_USERNAME") or "no-reply@example.com"
     message["To"] = to
     message["Subject"] = subject
     message.set_content(text)
-    with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")), timeout=15) as server:
-        server.starttls()
-        if os.getenv("SMTP_USERNAME"):
-            server.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD", ""))
-        server.send_message(message)
-    return "sent"
+    try:
+        if port == 465 or os.getenv("SMTP_SECURE", "").lower() == "ssl":
+            server = smtplib.SMTP_SSL(host, port, timeout=20)
+        else:
+            server = smtplib.SMTP(host, port, timeout=20)
+            server.starttls()
+        with server:
+            if os.getenv("SMTP_USERNAME"):
+                server.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD", ""))
+            server.send_message(message)
+        return "sent"
+    except Exception as exc:  # noqa: BLE001
+        print(f"SMTP send failed to {to}: {exc}")
+        return "failed"
 
 
 def expiry(value: Any) -> datetime:
@@ -181,6 +255,7 @@ def public_contract(contract_id: str, contract: dict) -> dict:
     doc = contract.get("document") or {}
     return {
         "id": contract_id,
+        "contractNo": contract.get("contractNo") or contract_id,
         "title": contract.get("title", ""),
         "summary": contract.get("summary", ""),
         "body": contract.get("body", ""),
@@ -210,10 +285,9 @@ def create_invite(tenant_id: str, contract_id: str, signer: dict, expires_at: da
     delivery = send_email(email, f"簽署邀請／Signing invitation: {title}",
                           f"請使用專屬連結完成簽署／Use your private signing link:\n{url}\n\n期限／Expires: {expires_at.isoformat()}")
     ref.update({"emailStatus": delivery, "lastSentAt": firestore.SERVER_TIMESTAMP})
-    result = {"signerId": signer_id, "email": email, "role": role, "emailStatus": delivery, "expiresAt": expires_at.isoformat()}
-    if delivery == "preview":  # 未設定 SMTP 時回傳連結，由建立者自行轉交
-        result["previewUrl"] = url
-    return result
+    # 連結只回給合約建立者（此端點需登入且必須是建立者），寄信成功與否都可自行轉交
+    return {"signerId": signer_id, "email": email, "role": role, "emailStatus": delivery,
+            "expiresAt": expires_at.isoformat(), "previewUrl": url}
 
 
 # ---------------------------------------------------------------- handlers
@@ -247,8 +321,20 @@ def h_create_contract(req, payload):
     if not mref.get().exists:
         mref.set({"uid": uid, "role": "Owner", "createdAt": firestore.SERVER_TIMESTAMP})
     contract_id = "c-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(3)
+    wanted = str(payload.get("contractNo", "")).strip()
+    contract_no = clean_number(wanted) if wanted else peek_next_number(tref)
+    for _ in range(5):  # 預設編號遇到同時建立時自動取下一號
+        try:
+            reserve_number(tref, contract_no, contract_id)
+            break
+        except ValueError:
+            if wanted:
+                raise
+            contract_no = peek_next_number(tref)
+    else:
+        raise ValueError("contract_no_taken")
     contract_ref(tenant_id, contract_id).set({
-        "contractId": contract_id, "title": title,
+        "contractId": contract_id, "contractNo": contract_no, "contractNoKey": number_key(contract_no), "title": title,
         "summary": str(payload.get("summary", "")).strip()[:2000],
         "body": str(payload.get("body", "")).strip()[:60000],
         "coverId": cover, "language": lang, "parties": clean,
@@ -256,7 +342,47 @@ def h_create_contract(req, payload):
         "createdBy": uid, "status": "draft", "signatures": [],
         "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
     })
-    return response({"ok": True, "tenantId": tenant_id, "contractId": contract_id})
+    return response({"ok": True, "tenantId": tenant_id, "contractId": contract_id, "contractNo": contract_no})
+
+
+def h_next_number(req):
+    user = require_user(req)
+    return response({"ok": True, "contractNo": peek_next_number(DB.collection("tenants").document(tenant_of(user["uid"])))})
+
+
+def h_rename(req, payload):
+    user = require_user(req)
+    tenant_id = tenant_of(user["uid"])
+    snap = owned_contract(user, tenant_id, str(payload.get("contractId", "")))
+    no = clean_number(payload.get("contractNo"))
+    old = (snap.to_dict() or {}).get("contractNo")
+    reserve_number(DB.collection("tenants").document(tenant_id), no, snap.id, release=old)
+    snap.reference.update({"contractNo": no, "contractNoKey": number_key(no), "updatedAt": firestore.SERVER_TIMESTAMP})
+    return response({"ok": True, "contractId": snap.id, "contractNo": no})
+
+
+def h_list(req):
+    """瀏覽／查詢自己的所有合約：q 比對合約編號、名稱、摘要、簽署方 Email／角色；status 篩選狀態。"""
+    user = require_user(req)
+    tenant_id = tenant_of(user["uid"])
+    q = str(req.args.get("q", "")).strip().lower()
+    status = str(req.args.get("status", "")).strip()
+    rows = []
+    for d in DB.collection("tenants").document(tenant_id).collection("contracts").where("createdBy", "==", user["uid"]).stream():
+        c = d.to_dict() or {}
+        if status and c.get("status") != status:
+            continue
+        hay = " ".join([str(c.get("contractNo", "")), d.id, c.get("title", ""), c.get("summary", ""),
+                        " ".join(f"{p.get('role', '')} {p.get('email', '')}" for p in c.get("parties", []))]).lower()
+        if q and q not in hay:
+            continue
+        rows.append({"id": d.id, "contractNo": c.get("contractNo") or d.id, "title": c.get("title", ""),
+                     "status": c.get("status", "draft"), "coverId": c.get("coverId", "classic-navy"),
+                     "partyCount": c.get("partyCount", len(c.get("parties", []))), "signedCount": len(c.get("signatures") or []),
+                     "parties": c.get("parties", []), "hasDocument": bool(c.get("document")),
+                     "createdAt": iso(c.get("createdAt")), "updatedAt": iso(c.get("updatedAt"))})
+    rows.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
+    return response({"ok": True, "tenantId": tenant_id, "total": len(rows), "contracts": rows[:500]})
 
 
 def h_upload_document(req, payload):
@@ -304,7 +430,8 @@ def h_translate(req, payload):
 
 def h_status(req):
     user = require_user(req)
-    snap = owned_contract(user, str(req.args.get("tenantId", "")), str(req.args.get("contractId", "")))
+    snap = resolve_contract(user, str(req.args.get("tenantId", "")) or tenant_of(user["uid"]),
+                            str(req.args.get("contractId", "")), str(req.args.get("contractNo", "")))
     contract = snap.to_dict() or {}
     invites = []
     for inv in snap.reference.collection(INVITES).stream():
@@ -313,11 +440,20 @@ def h_status(req):
         invites.append({"signerId": d.get("signerId"), "role": d.get("role"), "email": d.get("email"),
                         "status": d.get("status"), "expiresAt": iso(d.get("expiresAt")), "emailStatus": d.get("emailStatus"),
                         "reminderCount": d.get("reminderCount", 0),
+                        "link": link_of(d) if d.get("status") == "pending" else None,
                         "decision": {"action": dec.get("action"), "name": dec.get("name"), "reason": dec.get("reason"), "at": iso(dec.get("at"))} if dec else None})
     invites.sort(key=lambda x: x.get("signerId") or "")
     out = public_contract(snap.id, contract)
-    out.update({"pendingSigners": contract.get("pendingSigners"), "signedCount": len(contract.get("signatures") or [])})
+    out.update({"pendingSigners": contract.get("pendingSigners"), "signedCount": len(contract.get("signatures") or []),
+                "tenantId": snap.reference.parent.parent.id})
     return response({"ok": True, "contract": out, "invites": invites})
+
+
+def link_of(invite: dict) -> str | None:
+    try:
+        return f"{app_base_url()}/sign/{CIPHER.decrypt(invite['tokenCiphertext'].encode()).decode()}"
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def h_create_invites(req, payload):
@@ -341,7 +477,10 @@ def h_read_invite(req):
     invite = snap.to_dict() or {}
     error = validate_action(invite, "sign")
     if error:
-        return response({"error": error, "status": invite.get("status")}, 410 if error == "invite_expired" else 409)
+        cstatus = (snap.reference.parent.parent.get().to_dict() or {}).get("status")
+        return response({"error": error, "status": invite.get("status"), "contractStatus": cstatus,
+                         "signedPdfAvailable": invite.get("status") == "signed" and cstatus == "fully_signed"},
+                        410 if error == "invite_expired" else 409)
     cref = snap.reference.parent.parent
     contract = cref.get().to_dict() or {}
     if contract_closed(contract):
@@ -413,6 +552,58 @@ def h_action(req, payload):
     return response({"ok": True, **result})
 
 
+def signed_pdf_response(cref):
+    contract = cref.get().to_dict() or {}
+    if contract.get("status") != "fully_signed":
+        raise ValueError("contract_not_fully_signed")
+    cached = contract.get("signedPdf") or {}
+    b = bucket()
+    data = None
+    if cached.get("path"):
+        try:
+            data = b.blob(cached["path"]).download_as_bytes()
+        except Exception:  # noqa: BLE001 - 快取遺失就重新產生
+            data = None
+    if data is None:
+        emails = {(d.to_dict() or {}).get("signerId"): (d.to_dict() or {}).get("email") for d in cref.collection(INVITES).stream()}
+        sigs = []
+        for dec in sorted(contract.get("signatures") or [], key=lambda d: str(d.get("at"))):
+            image = None
+            if dec.get("signaturePath"):
+                try:
+                    image = b.blob(dec["signaturePath"]).download_as_bytes()
+                except Exception:  # noqa: BLE001
+                    image = None
+            sigs.append({**dec, "email": emails.get(dec.get("signerId"), ""), "image": image})
+        doc = contract.get("document") or {}
+        original = None
+        if doc.get("type") == "application/pdf" and doc.get("path"):
+            original = b.blob(doc["path"]).download_as_bytes()
+        data = build_signed_pdf(contract.get("contractNo") or cref.id, contract, sigs, original)
+        tenant_id = cref.parent.parent.id
+        path = f"tenants/{tenant_id}/contracts/{cref.id}/signed/{cref.id}-signed.pdf"
+        b.blob(path).upload_from_string(data, content_type="application/pdf")
+        cref.set({"signedPdf": {"path": path, "sha256": digest(data), "size": len(data), "at": firestore.SERVER_TIMESTAMP}}, merge=True)
+    from urllib.parse import quote
+    name = f"{contract.get('contractNo') or cref.id}-{contract.get('title', 'contract')}-已簽署.pdf"
+    return https_fn.Response(data, status=200, mimetype="application/pdf",
+                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}",
+                                      "Cache-Control": "private, no-store"})
+
+
+def h_owner_signed_pdf(req):
+    user = require_user(req)
+    snap = owned_contract(user, str(req.args.get("tenantId", "")), str(req.args.get("contractId", "")))
+    return signed_pdf_response(snap.reference)
+
+
+def h_signer_signed_pdf(req):
+    snap = find_invite(str(req.args.get("token", "")))
+    if (snap.to_dict() or {}).get("status") != "signed":
+        raise PermissionError("signer_only")
+    return signed_pdf_response(snap.reference.parent.parent)
+
+
 def h_reminders(req):
     require_user(req)
     now, sent = datetime.now(timezone.utc), 0
@@ -440,7 +631,7 @@ def api(req: https_fn.Request):
     if req.method == "OPTIONS":
         return response({"ok": True})
     if req.method == "GET" and path.endswith("/health"):
-        return response({"ok": True, "service": "mycontractapp-api", "region": "asia-east1", "version": "2026-10-16"})
+        return response({"ok": True, "service": "mycontractapp-api", "region": "asia-east1", "version": "2026-10-16b"})
     try:
         payload = req.get_json(silent=True) or {}
         m = req.method
@@ -448,6 +639,16 @@ def api(req: https_fn.Request):
             return h_upload_document(req, payload)
         if m == "GET" and path.endswith("/contracts/document"):
             return h_owner_document(req)
+        if m == "GET" and path.endswith("/contracts/next-number"):
+            return h_next_number(req)
+        if m == "GET" and path.endswith("/contracts/list"):
+            return h_list(req)
+        if m == "POST" and path.endswith("/contracts/number"):
+            return h_rename(req, payload)
+        if m == "GET" and path.endswith("/contracts/signed-pdf"):
+            return h_owner_signed_pdf(req)
+        if m == "GET" and path.endswith("/signature/signed-pdf"):
+            return h_signer_signed_pdf(req)
         if m == "POST" and path.endswith("/contracts/translate"):
             return h_translate(req, payload)
         if m == "GET" and path.endswith("/contracts/status"):
@@ -474,7 +675,7 @@ def api(req: https_fn.Request):
         return response({"error": str(exc)}, 404)
     except ValueError as exc:
         code = str(exc)
-        status = 409 if code in {"invite_already_consumed", "invite_not_pending", "contract_closed", "invites_already_sent", "document_locked_after_invite"} else (410 if code == "invite_expired" else 400)
+        status = 409 if code in {"invite_already_consumed", "invite_not_pending", "contract_closed", "invites_already_sent", "document_locked_after_invite", "contract_not_fully_signed", "contract_no_taken"} else (410 if code == "invite_expired" else 400)
         return response({"error": code}, status)
     except Exception as exc:  # noqa: BLE001
         return response({"error": "internal_error", "detail": str(exc)[:300]}, 500)
