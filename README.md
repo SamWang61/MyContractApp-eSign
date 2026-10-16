@@ -2,6 +2,8 @@
 
 > **使用說明手冊**：[firebase/docs/USER_MANUAL.md](firebase/docs/USER_MANUAL.md)（[PDF 版](firebase/docs/USER_MANUAL.pdf)）
 
+> **部署文件**：[部署到 Firebase](firebase/docs/DEPLOY_FIREBASE.md)（[PDF](firebase/docs/DEPLOY_FIREBASE.pdf)）｜[部署到 Render（Docker）](firebase/docs/DEPLOY_RENDER.md)（[PDF](firebase/docs/DEPLOY_RENDER.pdf)）
+
 | 頁面 | 說明 |
 |---|---|
 | `public/index.html` + `demo.js` | 示範模式：不連資料庫，兩方／三方一次性簽署連結（localStorage） |
