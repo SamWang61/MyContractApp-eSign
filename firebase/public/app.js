@@ -250,6 +250,22 @@ function validTaxId(t) {
   const sum = [...t].reduce((a, d, i) => { const x = Number(d) * w[i]; return a + Math.floor(x / 10) + (x % 10); }, 0);
   return sum % 5 === 0 || (t[6] === '7' && (sum + 1) % 5 === 0);
 }
+function noticeText(c) {
+  const n = c.completionNotice?.summary;
+  if (c.status !== 'fully_signed') return '';
+  if (!n) return '完成通知：尚未寄出';
+  if (n.sent === n.total) return `完成通知：已寄給 ${n.total} 位（${c.completionNotice.attached ? '附已簽署 PDF' : '附下載連結'}）`;
+  if (n.preview === n.total) return '完成通知：未設定寄信（SMTP），未寄出';
+  return `完成通知：成功 ${n.sent}／失敗 ${n.failed}／共 ${n.total}`;
+}
+async function resendNotice(tenantId, contractId, after) {
+  try {
+    const r = await call('/contracts/notify-completion', { method: 'POST', body: { tenantId, contractId }, token: await idToken() });
+    const n = r.notice || {};
+    toast(n.preview === n.total ? '尚未設定 SMTP，無法寄信' : `完成通知已重寄：成功 ${n.sent}／共 ${n.total}`);
+    after && after();
+  } catch (e) { toast(errText(e)); }
+}
 function partyOf(c, v) {
   const p = (c.parties || []).find((x) => x.email === v.email || x.role === v.role);
   return p ? partyLine(p) : '';
@@ -370,7 +386,8 @@ function renderTracking(data) {
     : c.status === 'declined' ? '有簽署方拒絕簽署，合約已鎖定。'
     : c.status === 'changes_requested' ? '有簽署方要求退回修改，合約已鎖定，請修改後重新建立。'
     : '等待其他簽署方完成（每 5 秒自動更新）。';
-  $('contract-state').innerHTML = `${esc(`${total} 方簽署｜已簽 ${c.signedCount}/${total}｜${tail}`)}${c.status === 'fully_signed' ? '<div class="row-btns"><button id="owner-dl" type="button">下載已簽署 PDF</button></div>' : ''}`;
+  $('contract-state').innerHTML = `${esc(`${total} 方簽署｜已簽 ${c.signedCount}/${total}｜${tail}`)}${c.status === 'fully_signed' ? `<p class="notice-line">${esc(noticeText(c))}</p><div class="row-btns"><button id="owner-dl" type="button">下載已簽署 PDF</button> <button id="owner-notify" class="secondary" type="button">重寄完成通知</button></div>` : ''}`;
+  if ($('owner-notify')) $('owner-notify').onclick = () => resendNotice(current.tenantId, c.id, () => openContract(c.id));
   if ($('owner-dl')) $('owner-dl').onclick = () => idToken().then((t) => downloadFile(`/contracts/signed-pdf?tenantId=${encodeURIComponent(current.tenantId)}&contractId=${encodeURIComponent(c.id)}`, t, 'signed-contract.pdf')).catch((e) => toast(errText(e)));
   $('parties').innerHTML = data.invites.map((v) => {
     const url = v.link || h.links?.[v.signerId];
@@ -493,8 +510,9 @@ function renderDetail() {
   $('d-no').value = c.contractNo;
   $('d-msg').className = 'muted';
   $('d-msg').textContent = `內部 ID ${c.id}｜建立 ${fmtDate(c.createdAt)}｜${invites.length ? `已簽 ${c.signedCount}/${invites.length}` : '尚未發出簽署邀請'}`;
-  $('d-actions').innerHTML = (c.status === 'fully_signed' ? '<button id="d-pdf" type="button">下載已簽署 PDF</button>' : '')
+  $('d-actions').innerHTML = (c.status === 'fully_signed' ? `<p class="notice-line">${esc(noticeText(c))}</p><button id="d-pdf" type="button">下載已簽署 PDF</button> <button id="d-notify" class="secondary" type="button">重寄完成通知</button>` : '')
     + (c.status === 'draft' ? '<span class="muted">此合約尚未發出邀請：請到「建立合約」頁的歷史紀錄開啟並發送。</span>' : '');
+  if ($('d-notify')) $('d-notify').onclick = () => resendNotice(detail.tenantId, c.id, () => loadDetail(c.contractNo || c.id));
   if ($('d-pdf')) $('d-pdf').onclick = () => idToken().then((t) => downloadFile(`/contracts/signed-pdf?tenantId=${encodeURIComponent(detail.tenantId)}&contractId=${encodeURIComponent(c.id)}`, t, `${c.contractNo}.pdf`)).catch((e) => toast(errText(e)));
   $('d-parties').innerHTML = invites.length ? invites.map((v) => {
     const d = v.decision ? `<p class="muted">${esc(v.decision.name || '')}${v.decision.reason ? '｜原因：' + esc(v.decision.reason) : ''}｜${fmtDate(v.decision.at)}</p>` : '';

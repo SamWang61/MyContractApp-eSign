@@ -3,6 +3,7 @@
 """
 import base64
 import io
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -216,6 +217,44 @@ pdfr = requests.get(API + f"/contracts/signed-pdf?tenantId={tnc}&contractId={cid
 from pypdf import PdfReader as _PR
 _txt = "".join(pg.extract_text() or "" for pg in _PR(io.BytesIO(pdfr.content)).pages)
 check("已簽署 PDF 含公司名稱、統編、地址、代表人", all(x in _txt for x in ["台灣大哥大股份有限公司", "04595257", "敦化南路", "林之晨", "Acme Corp.", "Jane Doe"]), pdfr.status_code)
+
+# ---- 合約完成後自動寄 Email 通知各方（需本機 SMTP 收信伺服器 127.0.0.1:2525 → /tmp/mails）
+import glob, email as _email, time as _t
+def _mails(subject_part):
+    out = []
+    for f in sorted(glob.glob("/tmp/mails/*.eml")):
+        m = _email.message_from_bytes(open(f, "rb").read(), policy=__import__("email.policy").policy.default)
+        subj = str(m["Subject"])
+        if subject_part in subj:
+            out.append((m, subj))
+    return out
+if os.path.isdir("/tmp/mails"):
+    stx = requests.get(API + "/contracts/status", headers=HN, params={"tenantId": tnc, "contractId": cidc}).json()["contract"]
+    cn = stx.get("completionNotice") or {}
+    check("完成時自動寄出通知（2 方＋副本 1 位）", (cn.get("summary") or {}).get("sent") == 3, cn)
+    no_c = stx["contractNo"]
+    got = _mails(f"【已完成簽署】{no_c}")
+    rc_to = sorted(m["To"] for m, _ in got)
+    check("收件人為各方與 COMPLETION_CC", rc_to == ["co1@example.com", "co2@example.com", "owner@example.com"], rc_to)
+    m0 = got[0][0]
+    att = [p for p in m0.walk() if p.get_content_type() == "application/pdf"]
+    body = next(p for p in m0.walk() if p.get_content_type() == "text/plain").get_content()
+    check("通知信附上已簽署 PDF", len(att) == 1 and att[0].get_payload(decode=True)[:5] == b"%PDF-", [p.get_content_type() for p in m0.walk()])
+    check("通知信列出公司資料與下載連結", "台灣大哥大股份有限公司" in body and "/sign/" in body and "SHA-256" in body, body[:300])
+    check("同一份合約只自動寄一次", len(got) == 3, len(got))
+    rr = requests.post(API + "/contracts/notify-completion", headers=HN, json={"tenantId": tnc, "contractId": cidc}).json()
+    check("管理者可手動重寄", rr.get("notice", {}).get("sent") == 3 and len(_mails(f"【已完成簽署】{no_c}")) == 6, rr)
+    # 尚未完成的合約不寄、也不能手動寄
+    r2 = requests.post(API + "/contracts", headers=HN, json={"title": "未完成合約", "parties": P2}).json()
+    inv2 = requests.post(API + "/signature/invite", headers=HN, json={"tenantId": r2["tenantId"], "contractId": r2["contractId"], "expiresAt": exp}).json()
+    tk2 = inv2["invites"][0]["previewUrl"].rsplit("/", 1)[1]
+    requests.post(API + "/signature/action", json={"token": tk2, "action": "sign", "name": "甲", "consent": True, "signatureImage": PNG})
+    no2 = requests.get(API + "/contracts/status", headers=HN, params={"tenantId": r2["tenantId"], "contractId": r2["contractId"]}).json()["contract"]["contractNo"]
+    check("部分簽署時不寄完成通知", not _mails(f"【已完成簽署】{no2}"))
+    bad3 = requests.post(API + "/contracts/notify-completion", headers=HN, json={"tenantId": r2["tenantId"], "contractId": r2["contractId"]})
+    check("未完成的合約不能手動寄完成通知", bad3.status_code in (400, 409), bad3.status_code)
+    other = requests.post(API + "/contracts/notify-completion", headers={"Authorization": "Bearer " + tok2}, json={"tenantId": tnc, "contractId": cidc})
+    check("別人不能替你的合約寄通知", other.status_code in (403, 404), other.status_code)
 ok = sum(1 for _, p in results if p)
 print(f"\n結果：{ok}/{len(results)} 通過")
 sys.exit(0 if ok == len(results) else 1)

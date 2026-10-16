@@ -94,3 +94,5 @@ canvas#sig{display:block;width:100%;height:auto;margin-top:7px;border:1px dashed
 
 .site-foot a { color: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
 .site-foot a:hover { color: #2563eb; }
+
+.notice-line { margin: 8px 0; font-size: 14px; color: #0f5132; }

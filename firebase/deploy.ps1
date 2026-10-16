@@ -126,7 +126,7 @@ Step 7 'Verifying the live site'
 Start-Sleep -Seconds 5
 try {
   $h = Invoke-RestMethod -Uri "$SiteUrl/api/health" -TimeoutSec 30
-  if ($h.version -eq '2026-10-16c') { Ok "API is live: $($h.service) $($h.version)" } else { Write-Host "  WARNING: API answered but version is '$($h.version)'. Wait 1 minute and refresh." -ForegroundColor Yellow }
+  if ($h.version -eq '2026-10-16d') { Ok "API is live: $($h.service) $($h.version)" } else { Write-Host "  WARNING: API answered but version is '$($h.version)'. Wait 1 minute and refresh." -ForegroundColor Yellow }
 } catch { Write-Host "  WARNING: health check failed: $($_.Exception.Message)" -ForegroundColor Yellow }
 
 Write-Host ""

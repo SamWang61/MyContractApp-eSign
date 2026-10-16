@@ -207,8 +207,8 @@ def find_invite(raw: str):
     return snap
 
 
-def send_email(to: str, subject: str, text: str) -> str:
-    """回傳 sent / preview（未設定 SMTP）/ failed（SMTP 錯誤，不中斷流程）。"""
+def send_email(to: str, subject: str, text: str, attachments: list[tuple[bytes, str]] | None = None) -> str:
+    """回傳 sent / preview（未設定 SMTP）/ failed（SMTP 錯誤，不中斷流程）。attachments: [(PDF bytes, 檔名)]"""
     host = os.getenv("SMTP_HOST")
     if not host:
         return "preview"
@@ -218,12 +218,15 @@ def send_email(to: str, subject: str, text: str) -> str:
     message["To"] = to
     message["Subject"] = subject
     message.set_content(text)
+    for data, filename in attachments or []:
+        message.add_attachment(data, maintype="application", subtype="pdf", filename=filename)
     try:
         if port == 465 or os.getenv("SMTP_SECURE", "").lower() == "ssl":
             server = smtplib.SMTP_SSL(host, port, timeout=20)
         else:
             server = smtplib.SMTP(host, port, timeout=20)
-            server.starttls()
+            if os.getenv("SMTP_SECURE", "").lower() != "none":  # none：內部轉信伺服器不加密
+                server.starttls()
         with server:
             if os.getenv("SMTP_USERNAME"):
                 server.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD", ""))
@@ -463,7 +466,9 @@ def h_status(req):
                         "decision": {"action": dec.get("action"), "name": dec.get("name"), "reason": dec.get("reason"), "at": iso(dec.get("at"))} if dec else None})
     invites.sort(key=lambda x: x.get("signerId") or "")
     out = public_contract(snap.id, contract)
-    out.update({"pendingSigners": contract.get("pendingSigners"), "signedCount": len(contract.get("signatures") or []),
+    notice = contract.get("completionNotice") or {}
+    out.update({"completionNotice": {"summary": notice.get("summary"), "at": iso(notice.get("at")), "attached": notice.get("attached")} if notice.get("summary") else None,
+                "pendingSigners": contract.get("pendingSigners"), "signedCount": len(contract.get("signatures") or []),
                 "tenantId": snap.reference.parent.parent.id})
     return response({"ok": True, "contract": out, "invites": invites})
 
@@ -568,10 +573,17 @@ def h_action(req, payload):
     result = consume(tx)
     if signature_png and sig_path:
         bucket().blob(sig_path).upload_from_string(signature_png, content_type="image/png")
+    if result.get("status") == "fully_signed":
+        try:  # 寄信失敗不影響簽署結果；管理台可看到結果並手動重寄
+            result["completionNotice"] = notify_completion(snap.reference.parent.parent)
+        except Exception as exc:  # noqa: BLE001
+            print(f"completion notice failed: {exc}")
+            result["completionNotice"] = {"error": "notify_failed"}
     return response({"ok": True, **result})
 
 
-def signed_pdf_response(cref):
+def signed_pdf_bytes(cref) -> tuple[bytes, str, dict]:
+    """回傳（已簽署 PDF、下載檔名、合約資料）；PDF 產生一次後快取在 Storage。"""
     contract = cref.get().to_dict() or {}
     if contract.get("status") != "fully_signed":
         raise ValueError("contract_not_fully_signed")
@@ -603,8 +615,80 @@ def signed_pdf_response(cref):
         path = f"tenants/{tenant_id}/contracts/{cref.id}/signed/{cref.id}-signed.pdf"
         b.blob(path).upload_from_string(data, content_type="application/pdf")
         cref.set({"signedPdf": {"path": path, "sha256": digest(data), "size": len(data), "at": firestore.SERVER_TIMESTAMP}}, merge=True)
-    from urllib.parse import quote
     name = f"{contract.get('contractNo') or cref.id}-{contract.get('title', 'contract')}-已簽署.pdf"
+    return data, name, contract
+
+
+MAX_ATTACHMENT = 10 * 1024 * 1024  # 超過 10 MB 改為只附下載連結（多數信箱上限 20–25 MB）
+
+
+def notify_completion(cref, force: bool = False) -> dict:
+    """合約全部簽署完成後，寄「完成通知＋已簽署 PDF」給每一方（以及 COMPLETION_CC 名單）。
+    以交易搶旗標，同一份合約只會自動寄一次；force=True 供管理者手動重寄。"""
+    tx = DB.transaction()
+
+    @firestore.transactional
+    def claim(transaction):
+        c = tx_get(transaction, cref)
+        if c.get("status") != "fully_signed":
+            return False
+        if (c.get("completionNotice") or {}).get("claimedAt") and not force:
+            return False
+        transaction.update(cref, {"completionNotice.claimedAt": firestore.SERVER_TIMESTAMP})
+        return True
+
+    if not claim(tx):
+        return {"skipped": True}
+    data, filename, contract = signed_pdf_bytes(cref)
+    no = contract.get("contractNo") or cref.id
+    title = contract.get("title", "合約")
+    parties = contract.get("parties") or []
+    lines = []
+    for p in parties:
+        extra = "、".join(x for x in [p.get("company", ""), f"統編 {p['taxId']}" if p.get("taxId") else "", f"代表人 {p['representative']}" if p.get("representative") else ""] if x)
+        lines.append(f"  ・{p.get('role', '')}：{p.get('email', '')}" + (f"（{extra}）" if extra else ""))
+    signed_at = max((str(d.get("at")) for d in contract.get("signatures") or []), default="")
+    attach = [(data, filename)] if len(data) <= MAX_ATTACHMENT else []
+    sha = digest(data)
+    recipients = {}
+    for inv in cref.collection(INVITES).stream():
+        d = inv.to_dict() or {}
+        if d.get("email"):
+            recipients[d["email"].lower()] = link_of(d)
+    for cc in (os.getenv("COMPLETION_CC") or "").split(","):
+        if cc.strip() and "@" in cc:
+            recipients.setdefault(cc.strip().lower(), None)
+    results = {}
+    for email, link in recipients.items():
+        text = "\n".join([
+            "您好：", "",
+            f"合約「{title}」（編號 {no}）已由全部簽署方完成電子簽署。", "",
+            "簽署方：", *lines, "",
+            f"完成時間：{signed_at[:19]}（UTC）",
+            f"已簽署 PDF SHA-256：{sha}", "",
+            "已簽署 PDF 已附在本信。" if attach else "PDF 檔案較大，請用下方連結下載。",
+            f"隨時重新下載：{link}" if link else "", "",
+            "此信由合約管理系統自動寄出，請勿直接回覆。",
+        ])
+        results[email.replace(".", "\uff0e")] = send_email(email, f"【已完成簽署】{no} {title}", text, attach)
+    summary = {"sent": sum(v == "sent" for v in results.values()), "failed": sum(v == "failed" for v in results.values()),
+               "preview": sum(v == "preview" for v in results.values()), "total": len(results)}
+    cref.set({"completionNotice": {"results": results, "summary": summary, "at": firestore.SERVER_TIMESTAMP,
+                                   "attached": bool(attach)}}, merge=True)
+    return summary
+
+
+def h_notify_completion(req, payload):
+    user = require_user(req)
+    snap = owned_contract(user, str(payload.get("tenantId", "")), str(payload.get("contractId", "")))
+    if (snap.to_dict() or {}).get("status") != "fully_signed":
+        raise ValueError("contract_not_fully_signed")
+    return response({"ok": True, "notice": notify_completion(snap.reference, force=True)})
+
+
+def signed_pdf_response(cref):
+    from urllib.parse import quote
+    data, name, _ = signed_pdf_bytes(cref)
     return https_fn.Response(data, status=200, mimetype="application/pdf",
                              headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}",
                                       "Cache-Control": "private, no-store"})
@@ -650,7 +734,7 @@ def api(req: https_fn.Request):
     if req.method == "OPTIONS":
         return response({"ok": True})
     if req.method == "GET" and path.endswith("/health"):
-        return response({"ok": True, "service": "mycontractapp-api", "region": "asia-east1", "version": "2026-10-16c"})
+        return response({"ok": True, "service": "mycontractapp-api", "region": "asia-east1", "version": "2026-10-16d"})
     try:
         payload = req.get_json(silent=True) or {}
         m = req.method
@@ -664,6 +748,8 @@ def api(req: https_fn.Request):
             return h_list(req)
         if m == "POST" and path.endswith("/contracts/number"):
             return h_rename(req, payload)
+        if m == "POST" and path.endswith("/contracts/notify-completion"):
+            return h_notify_completion(req, payload)
         if m == "GET" and path.endswith("/contracts/signed-pdf"):
             return h_owner_signed_pdf(req)
         if m == "GET" and path.endswith("/signature/signed-pdf"):
