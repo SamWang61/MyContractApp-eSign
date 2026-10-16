@@ -91,3 +91,6 @@ canvas#sig{display:block;width:100%;height:auto;margin-top:7px;border:1px dashed
 .party-co { margin: 4px 0; font-size: 14px; color: #172033; }
 .cover .c-parties small { opacity: .8; font-size: .85em; }
 @media (max-width: 720px) { .signer-card { grid-template-columns: 1fr !important; } .signer-card .wide { grid-column: auto; } }
+
+.site-foot a { color: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+.site-foot a:hover { color: #2563eb; }
