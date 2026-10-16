@@ -2,7 +2,9 @@
 # Usage (inside the "firebase" folder):  powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 # Messages are in English on purpose: Windows PowerShell 5 mis-reads non-ASCII text in scripts.
 
-$ErrorActionPreference = 'Stop'
+param([switch]$KeyOnly)
+# Continue: native tools (py, pip, firebase) print warnings on stderr; each step checks exit codes itself.
+$ErrorActionPreference = 'Continue'
 $ProjectId = 'mycontractapp-911'
 $SiteUrl   = 'https://mycontractapp-911.web.app'
 $Here      = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -61,33 +63,41 @@ Ok 'packages installed'
 # ---------------------------------------------------------------- 4. .env
 Step 4 'Preparing functions\.env (keeps your existing signing key if found)'
 $envFile = Join-Path $Here 'functions\.env'
-$key = $null
-if (Test-Path $envFile) {
-  $m = Select-String -Path $envFile -Pattern '^SIGNING_TOKEN_ENCRYPTION_KEY=(.+)$' | Select-Object -First 1
-  if ($m) { $key = $m.Matches[0].Groups[1].Value.Trim() }
+
+function Read-Key($path) {
+  # Returns the signing key from a .env file, or $null. Never throws (unreadable / locked / missing files are skipped).
+  try {
+    $text = [System.IO.File]::ReadAllText($path)
+    $m = [regex]::Match($text, '(?m)^SIGNING_TOKEN_ENCRYPTION_KEY=(.+?)\s*$')
+    if ($m.Success -and $m.Groups[1].Value.Trim().Length -ge 16) { return $m.Groups[1].Value.Trim() }
+  } catch { }
+  return $null
 }
+
+$key = $null
+if (Test-Path $envFile) { $key = Read-Key $envFile; if ($key) { Ok 'kept the signing key already in functions\.env' } }
 if (-not $key) {
   $roots = @("$env:USERPROFILE\iCloudDrive", "$env:USERPROFILE\OneDrive", "$env:USERPROFILE\Documents", "$env:USERPROFILE\Desktop") | Where-Object { Test-Path $_ }
-  foreach ($r in $roots) {
-    $old = Get-ChildItem -Path $r -Filter '.env' -Recurse -Force -Depth 6 -ErrorAction SilentlyContinue |
-      Where-Object { $_.FullName -match 'MyContractApp|E-ContractApp' -and $_.FullName -notmatch 'venv|node_modules' -and $_.FullName -ne $envFile } |
-      Select-Object -First 1
-    if ($old) {
-      $m = Select-String -Path $old.FullName -Pattern '^SIGNING_TOKEN_ENCRYPTION_KEY=(.+)$' | Select-Object -First 1
-      if ($m) { $key = $m.Matches[0].Groups[1].Value.Trim(); Ok "reused signing key from $($old.FullName)"; break }
+  :search foreach ($r in $roots) {
+    $cands = Get-ChildItem -Path $r -Filter '.env' -Recurse -Force -Depth 7 -ErrorAction SilentlyContinue |
+      Where-Object { $_.Directory.Name -eq 'functions' -and $_.FullName -notmatch '\\venv\\|node_modules' -and $_.FullName -ne $envFile -and $_.FullName -notmatch 'MyContractApp-eSign' }
+    foreach ($c in $cands) {
+      $k = Read-Key $c.FullName
+      if ($k) { $key = $k; Ok "reused signing key from $($c.FullName)"; break search }
     }
   }
 }
 if (-not $key) {
   $bytes = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-  $key = [Convert]::ToBase64String($bytes); Ok 'generated a new signing key'
+  $key = [Convert]::ToBase64String($bytes); Ok 'generated a new signing key (old unsigned links from the previous system will stop working)'
 }
 $lines = @()
-if (Test-Path $envFile) { $lines = Get-Content $envFile | Where-Object { $_ -notmatch '^(APP_BASE_URL|APP_ENV|SIGNING_TOKEN_ENCRYPTION_KEY|TRANSLATE_FAKE|STORAGE_EMULATOR_HOST)=' } }
-$lines += "APP_BASE_URL=$SiteUrl"; $lines += 'APP_ENV=production'; $lines += "SIGNING_TOKEN_ENCRYPTION_KEY=$key"
+if (Test-Path $envFile) { $lines = @(@(Get-Content $envFile -ErrorAction SilentlyContinue) | Where-Object { $_ -and $_ -notmatch '^(APP_BASE_URL|APP_ENV|SIGNING_TOKEN_ENCRYPTION_KEY|TRANSLATE_FAKE|STORAGE_EMULATOR_HOST)=' }) }
+$lines = @($lines) + @("APP_BASE_URL=$SiteUrl", 'APP_ENV=production', "SIGNING_TOKEN_ENCRYPTION_KEY=$key")
 [System.IO.File]::WriteAllLines($envFile, $lines)
 $local = Join-Path $Here 'functions\.env.local'; if (Test-Path $local) { Remove-Item $local -Force }
 Ok 'functions\.env ready (SMTP lines, if any, were kept)'
+if ($KeyOnly) { exit 0 }
 
 # ---------------------------------------------------------------- 5. login
 Step 5 'Checking Firebase login'
