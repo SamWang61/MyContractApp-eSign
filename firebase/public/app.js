@@ -31,7 +31,7 @@ const ERR = {
   translation_api_not_enabled: '英文翻譯尚未啟用：請在 Google Cloud 啟用「Cloud Translation API」。',
   unsupported_language: '不支援的語言。', invite_not_found: '找不到這份簽署邀請，請確認連結是否完整。',
   invite_already_consumed: '此連結已使用過，不能重複操作。', invite_not_pending: '此邀請目前無法簽署。',
-  invite_expired: '此連結已逾期，請向合約管理者重新索取。', contract_closed: '此合約已被拒絕、退回或已完成，無法再簽署。', contract_not_fully_signed: '所有簽署方完成後才能下載已簽署 PDF。', invalid_contract_no: '合約編號格式不正確：2–40 個字元，只能用英數字、減號、底線、點，且以英數字開頭。', contract_no_taken: '這個合約編號已被使用，請換一個。', contract_not_found: '找不到這份合約（請確認合約編號，或是否用建立合約的同一個瀏覽器開啟）。', signer_only: '只有已簽署的簽署人可以下載。',
+  invite_expired: '此連結已逾期，請向合約管理者重新索取。', contract_closed: '此合約已被拒絕、退回或已完成，無法再簽署。', contract_not_fully_signed: '所有簽署方完成後才能下載已簽署 PDF。', invalid_contract_no: '合約編號格式不正確：2–40 個字元，只能用英數字、減號、底線、點，且以英數字開頭。', contract_no_taken: '這個合約編號已被使用，請換一個。', invalid_tax_id: '統一編號不正確：台灣統編為 8 位數字（請確認檢查碼），外國公司可填 1–20 碼英數字。', contract_not_found: '找不到這份合約（請確認合約編號，或是否用建立合約的同一個瀏覽器開啟）。', signer_only: '只有已簽署的簽署人可以下載。',
   name_and_consent_required: '請填寫姓名並勾選電子簽署同意。', reason_required: '退回或拒絕時請填寫原因。',
   signature_required: '請在簽名欄手寫簽名。', token_required: '連結缺少簽署 Token。', document_not_found: '這份合約沒有上傳文件。'
 };
@@ -63,7 +63,7 @@ async function call(path, { method = 'GET', body, token } = {}) {
 function coverHtml(c, lang = 'zh-TW', fields = null) {
   const u = UI[lang] || UI['zh-TW'];
   const f = fields || c;
-  const parties = (c.parties || []).map((p) => `<div>${esc(p.role)}：${esc(p.email)}</div>`).join('');
+  const parties = (c.parties || []).map((p) => `<div>${esc(p.role)}：${esc(p.company || p.email)}${p.taxId ? `<small>（${esc(p.taxId)}）</small>` : ''}${p.representative ? `<small>　${esc(p.representative)}</small>` : ''}</div>`).join('');
   return `<div class="cover ${esc(c.coverId || 'classic-navy')}">
     <div class="c-brand">GLOBAL CONTRACT MANAGEMENT</div>
     <div class="c-kind">${u.kind}</div>
@@ -228,10 +228,34 @@ function renderCovers() {
 }
 function renderSignerRows() {
   const n = Number(document.querySelector('input[name="parties"]:checked').value);
-  const old = [...document.querySelectorAll('.signer-email')].map((i) => i.value);
-  $('signer-rows').innerHTML = ROLES.slice(0, n).map((role, i) => `<div class="signer-row">
-      <label>角色<input class="signer-role" maxlength="20" value="${esc(role)}"></label>
-      <label>${esc(role)} Email<input class="signer-email" type="email" autocomplete="off" placeholder="name@company.com" value="${esc(old[i] || '')}"></label></div>`).join('');
+  const old = [...document.querySelectorAll('.signer-row')].map(readSigner);
+  $('signer-rows').innerHTML = ROLES.slice(0, n).map((role, i) => { const o = old[i] || {}; return `<div class="signer-row signer-card">
+      <label>角色<input class="signer-role" maxlength="20" value="${esc(o.role || role)}"></label>
+      <label>Email（必填）<input class="signer-email" type="email" autocomplete="off" placeholder="name@company.com" value="${esc(o.email || '')}"></label>
+      <label>公司名稱<input class="signer-company" maxlength="120" placeholder="例如 全球科技股份有限公司" value="${esc(o.company || '')}"></label>
+      <label>統一編號<input class="signer-tax" maxlength="20" inputmode="numeric" placeholder="8 位數字" value="${esc(o.taxId || '')}"></label>
+      <label class="wide">公司地址<input class="signer-address" maxlength="200" placeholder="例如 台北市信義區信義路五段 7 號" value="${esc(o.address || '')}"></label>
+      <label>代表人<input class="signer-rep" maxlength="60" placeholder="例如 王大明" value="${esc(o.representative || '')}"></label></div>`; }).join('');
+}
+function readSigner(row) {
+  const v = (c) => row.querySelector(c)?.value.trim() || '';
+  return { role: v('.signer-role'), email: v('.signer-email').toLowerCase(), company: v('.signer-company'), taxId: v('.signer-tax').toUpperCase().replace(/\s/g, ''), address: v('.signer-address'), representative: v('.signer-rep') };
+}
+/* 台灣統一編號檢查碼（2023 新制：加權和可被 5 整除；第 7 碼為 7 時加 1 亦可） */
+function validTaxId(t) {
+  if (!t) return true;
+  if (!/^[A-Z0-9-]{1,20}$/.test(t)) return false;
+  if (!/^\d{8}$/.test(t)) return true;
+  const w = [1, 2, 1, 2, 1, 2, 4, 1];
+  const sum = [...t].reduce((a, d, i) => { const x = Number(d) * w[i]; return a + Math.floor(x / 10) + (x % 10); }, 0);
+  return sum % 5 === 0 || (t[6] === '7' && (sum + 1) % 5 === 0);
+}
+function partyOf(c, v) {
+  const p = (c.parties || []).find((x) => x.email === v.email || x.role === v.role);
+  return p ? partyLine(p) : '';
+}
+function partyLine(p) {
+  return [p.company, p.taxId && `統編 ${p.taxId}`, p.representative && `代表人 ${p.representative}`, p.address].filter(Boolean).map(esc).join('｜');
 }
 const fileB64 = (file) => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(String(r.result)); r.onerror = () => no(r.error); r.readAsDataURL(file); });
 
@@ -239,12 +263,15 @@ async function createContract() {
   const msg = $('create-msg');
   msg.className = 'error';
   const title = $('c-title').value.trim();
-  const roles = [...document.querySelectorAll('.signer-role')].map((i) => i.value.trim());
-  const emails = [...document.querySelectorAll('.signer-email')].map((i) => i.value.trim().toLowerCase());
+  const signers = [...document.querySelectorAll('.signer-row')].map(readSigner);
+  const roles = signers.map((x) => x.role);
+  const emails = signers.map((x) => x.email);
   if (!title) { msg.textContent = ERR.title_required; return; }
   if (roles.some((r) => !r)) { msg.textContent = '每一方都需要角色名稱。'; return; }
   if (emails.some((e) => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) { msg.textContent = '請填寫每一方正確的 Email。'; return; }
   if (new Set(emails).size !== emails.length) { msg.textContent = '每一方的 Email 不能重複。'; return; }
+  const badTax = signers.find((x) => !validTaxId(x.taxId));
+  if (badTax) { msg.textContent = `${badTax.role}：${ERR.invalid_tax_id}`; return; }
   const file = $('c-file').files[0];
   if (file && file.size > 10 * 1024 * 1024) { msg.textContent = ERR.file_too_large; return; }
   $('create-btn').disabled = true;
@@ -254,7 +281,7 @@ async function createContract() {
     msg.textContent = '建立合約中…';
     const r = await call('/contracts', { method: 'POST', token, body: {
       title, summary: $('c-summary').value.trim(), body: $('c-body').value.trim(), language: $('c-lang').value,
-      coverId: cover, parties: roles.map((role, i) => ({ role, email: emails[i] })), contractNo: $('c-no').value.trim()
+      coverId: cover, parties: signers, contractNo: $('c-no').value.trim()
     } });
     if (file) {
       msg.textContent = `上傳文件 ${file.name}…`;
@@ -353,7 +380,7 @@ function renderTracking(data) {
       : '';
     const d = v.decision ? `<p class="muted">${esc(v.decision.name || '')}${v.decision.reason ? '｜原因：' + esc(v.decision.reason) : ''}｜${fmtDate(v.decision.at)}</p>` : '';
     return `<div class="card party"><div class="party-head"><span class="role">${esc(v.role)}</span><span class="status ${esc(v.status)}">${esc(INVITE_TEXT[v.status] || v.status)}</span></div>
-      <p class="muted">${esc(v.email)}｜期限 ${fmtDate(v.expiresAt)}｜Email：${({ sent: '已寄出', failed: '寄送失敗', preview: '未寄信（手動轉交）' })[v.emailStatus] || '—'}</p>${d}${link}</div>`;
+      ${partyOf(c, v) ? `<p class="party-co">${partyOf(c, v)}</p>` : ''}<p class="muted">${esc(v.email)}｜期限 ${fmtDate(v.expiresAt)}｜Email：${({ sent: '已寄出', failed: '寄送失敗', preview: '未寄信（手動轉交）' })[v.emailStatus] || '—'}</p>${d}${link}</div>`;
   }).join('');
   $('parties').querySelectorAll('[data-copy]').forEach((b) => (b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); toast('已複製簽署連結'); } catch { prompt('請手動複製連結', b.dataset.copy); } }));
 }
@@ -422,7 +449,7 @@ async function loadList() {
     $('list-body').innerHTML = r.contracts.length ? r.contracts.map((c) => `<a class="c-row" href="/contracts/${encodeURIComponent(c.contractNo)}">
         <div class="no">${esc(c.contractNo)}</div>
         <div><div class="t"><span class="swatch" style="background:${SWATCH[c.coverId] || '#0f1f3d'}"></span>${esc(c.title)}</div>
-          <div class="sub">${c.parties.map((p) => `${esc(p.role)} ${esc(p.email)}`).join('｜')}${c.hasDocument ? '｜附件' : ''}</div></div>
+          <div class="sub">${c.parties.map((p) => `${esc(p.role)} ${esc(p.company || p.email)}${p.taxId ? `（${esc(p.taxId)}）` : ''}`).join('｜')}${c.hasDocument ? '｜附件' : ''}</div></div>
         <div class="sub">建立 ${fmtDate(c.createdAt)}</div>
         <div><span class="status ${esc(c.status)}">${esc(CONTRACT_TEXT[c.status] || c.status)}</span><div class="sub">已簽 ${c.signedCount}/${c.partyCount}</div></div>
       </a>`).join('') : `<p class="muted">${q || st ? '沒有符合條件的合約。' : '還沒有合約，請到「建立合約」新增。'}</p>`;
@@ -473,8 +500,8 @@ function renderDetail() {
     const d = v.decision ? `<p class="muted">${esc(v.decision.name || '')}${v.decision.reason ? '｜原因：' + esc(v.decision.reason) : ''}｜${fmtDate(v.decision.at)}</p>` : '';
     const link = v.link ? `<div class="link-box">${esc(v.link)}</div><div class="row-btns"><button class="secondary" data-copy="${esc(v.link)}">複製簽署連結</button></div>` : '';
     return `<div class="card party"><div class="party-head"><span class="role">${esc(v.role)}</span><span class="status ${esc(v.status)}">${esc(INVITE_TEXT[v.status] || v.status)}</span></div>
-      <p class="muted">${esc(v.email)}｜期限 ${fmtDate(v.expiresAt)}</p>${d}${link}</div>`;
-  }).join('') : (c.parties || []).map((p) => `<div class="card party"><div class="party-head"><span class="role">${esc(p.role)}</span><span class="status draft">未發邀請</span></div><p class="muted">${esc(p.email)}</p></div>`).join('');
+      ${partyOf(c, v) ? `<p class="party-co">${partyOf(c, v)}</p>` : ''}<p class="muted">${esc(v.email)}｜期限 ${fmtDate(v.expiresAt)}</p>${d}${link}</div>`;
+  }).join('') : (c.parties || []).map((p) => `<div class="card party"><div class="party-head"><span class="role">${esc(p.role)}</span><span class="status draft">未發邀請</span></div>${partyLine(p) ? `<p class="party-co">${partyLine(p)}</p>` : ''}<p class="muted">${esc(p.email)}</p></div>`).join('');
   $('d-parties').querySelectorAll('[data-copy]').forEach((b) => (b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.copy); toast('已複製簽署連結'); } catch { prompt('請手動複製連結', b.dataset.copy); } }));
 }
 async function loadDetail(key) {

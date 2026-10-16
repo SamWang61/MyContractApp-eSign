@@ -84,3 +84,10 @@ canvas#sig{display:block;width:100%;height:auto;margin-top:7px;border:1px dashed
 .c-row { grid-template-columns: 130px 1fr 190px 120px; }
 .c-row > .sub { white-space: nowrap; }
 .no-edit a.btn { display: inline-flex; align-items: center; padding: 10px 16px; border-radius: 10px; border: 1px solid #cbd5e1; background: #fff; color: #172033; text-decoration: none; font-weight: 600; }
+
+/* 簽署方公司資料 */
+.signer-card { grid-template-columns: 1fr 2fr 2fr 1fr; padding: 14px; border: 1px solid #e2e8f0; border-radius: 12px; background: #fafbfd; }
+.signer-card .wide { grid-column: span 3; }
+.party-co { margin: 4px 0; font-size: 14px; color: #172033; }
+.cover .c-parties small { opacity: .8; font-size: .85em; }
+@media (max-width: 720px) { .signer-card { grid-template-columns: 1fr !important; } .signer-card .wide { grid-column: auto; } }

@@ -84,10 +84,15 @@ def build_signed_pdf(contract_id: str, contract: dict, signatures: list[dict], o
         pdf.set_font("latin", size=11)
         pdf.multi_cell(166, 7, contract["summary"], new_x="LMARGIN", new_y="NEXT", align="L")
     pdf.ln(6)
-    pdf.set_font("latin", size=11)
     for p in contract.get("parties", []):
         pdf.set_x(22)
-        pdf.cell(0, 7, f"{p.get('role', '')}：{p.get('email', '')}", new_x="LMARGIN", new_y="NEXT", align="L")
+        pdf.set_font("latin", size=11)
+        pdf.cell(0, 7, f"{p.get('role', '')}：{p.get('company') or p.get('email', '')}", new_x="LMARGIN", new_y="NEXT", align="L")
+        extra = "　".join(x for x in [f"統編 {p['taxId']}" if p.get("taxId") else "", f"代表人 {p['representative']}" if p.get("representative") else ""] if x)
+        if extra:
+            pdf.set_x(28)
+            pdf.set_font("latin", size=9)
+            pdf.cell(0, 5, extra, new_x="LMARGIN", new_y="NEXT", align="L")
     pdf.set_xy(22, 262)
     pdf.set_font("latin", size=9)
     pdf.cell(0, 6, f"合約編號 Contract ID：{contract_id}", new_x="LMARGIN", new_y="NEXT", align="L")
@@ -97,6 +102,19 @@ def build_signed_pdf(contract_id: str, contract: dict, signatures: list[dict], o
     # ---- 條款與文件文字
     pdf.add_page()
     pdf.set_text_color(23, 32, 51)
+    pdf.set_font("latin", size=16)
+    pdf.cell(0, 10, "立約當事人 Parties", new_x="LMARGIN", new_y="NEXT", align="L")
+    for p in contract.get("parties", []):
+        pdf.set_font("latin", size=11)
+        pdf.cell(0, 7, f"{p.get('role', '')}　{p.get('company') or '（個人 Individual）'}", new_x="LMARGIN", new_y="NEXT", align="L")
+        pdf.set_font("latin", size=9)
+        pdf.set_text_color(90, 100, 120)
+        for label, key in (("統一編號 Tax ID", "taxId"), ("地址 Address", "address"), ("代表人 Representative", "representative"), ("Email", "email")):
+            if p.get(key):
+                pdf.multi_cell(0, 5, f"    {label}：{p[key]}", new_x="LMARGIN", new_y="NEXT", align="L")
+        pdf.set_text_color(23, 32, 51)
+        pdf.ln(1)
+    pdf.ln(3)
     pdf.set_font("latin", size=16)
     pdf.cell(0, 10, "合約條款 Terms", new_x="LMARGIN", new_y="NEXT", align="L")
     pdf.set_font("latin", size=11)
@@ -127,13 +145,18 @@ def build_signed_pdf(contract_id: str, contract: dict, signatures: list[dict], o
             pdf.add_page()
         top = pdf.get_y()
         pdf.set_draw_color(205, 214, 228)
-        pdf.rect(18, top, 174, 44)
+        pdf.rect(18, top, 174, 46)
         pdf.set_xy(22, top + 4)
         pdf.set_font("latin", size=12)
         pdf.cell(80, 7, f"{s.get('role', '')}　{s.get('name', '')}", new_x="LMARGIN", new_y="NEXT", align="L")
         pdf.set_font("latin", size=9)
         pdf.set_text_color(90, 100, 120)
-        for line in (s.get("email", ""), f"簽署時間 Signed at：{_fmt(s.get('at'))}", ACTION_TEXT.get(s.get("action", "sign"), "")):
+        party = next((p for p in contract.get("parties", []) if p.get("email") == s.get("email") or p.get("role") == s.get("role")), {})
+        comp = party.get("company", "")
+        ids = "｜".join(x for x in [f"統編 {party['taxId']}" if party.get("taxId") else "", f"代表人 {party['representative']}" if party.get("representative") else ""] if x)
+        for line in (comp, ids, s.get("email", ""), f"簽署時間 Signed at：{_fmt(s.get('at'))}", ACTION_TEXT.get(s.get("action", "sign"), "")):
+            if not line:
+                continue
             pdf.set_x(22)
             pdf.cell(80, 6, line, new_x="LMARGIN", new_y="NEXT", align="L")
         pdf.set_text_color(23, 32, 51)

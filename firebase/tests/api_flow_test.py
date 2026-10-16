@@ -187,6 +187,35 @@ check("PDF 檔名使用合約編號", _no3.startswith("C-") and _no3 in _cd, (_n
 for path in ["/contracts", "/contracts/PO-0001"]:
     r = requests.get(BASE + path)
     check(f"網頁 {path} 可開啟", r.status_code == 200 and 'id="list-page"' in r.text, r.status_code)
+
+# ---- 簽署方公司資料：公司名稱／統一編號／公司地址／代表人
+PC = [{"role": "甲方", "email": "co1@example.com", "company": "台灣大哥大股份有限公司", "taxId": "04595257", "address": "台北市大安區敦化南路二段 207 號", "representative": "林之晨"},
+      {"role": "乙方", "email": "co2@example.com", "company": "Acme Corp.", "taxId": "US-12-3456789", "address": "1 Market St, San Francisco", "representative": "Jane Doe"}]
+rc = requests.post(API + "/contracts", headers=HN, json={"title": "公司資料合約", "parties": PC})
+check("建立含公司資料的合約", rc.status_code == 200, rc.text[:120])
+stc = requests.get(API + "/contracts/status", headers=HN, params={"contractId": rc.json().get("contractId")}).json()["contract"]["parties"]
+check("四個欄位完整保存", stc[0]["company"] == "台灣大哥大股份有限公司" and stc[0]["taxId"] == "04595257" and stc[0]["address"].startswith("台北市") and stc[0]["representative"] == "林之晨" and stc[1]["taxId"] == "US-12-3456789", stc[0])
+bad = requests.post(API + "/contracts", headers=HN, json={"title": "錯統編", "parties": [dict(PC[0], taxId="12345678"), PC[1]]})
+check("台灣統編檢查碼錯誤會被拒絕", bad.status_code == 400 and bad.json()["error"] == "invalid_tax_id", bad.text[:100])
+bad2 = requests.post(API + "/contracts", headers=HN, json={"title": "錯統編", "parties": [dict(PC[0], taxId="含/符號"), PC[1]]})
+check("統編含非法字元會被拒絕", bad2.status_code == 400, bad2.status_code)
+ok_blank = requests.post(API + "/contracts", headers=HN, json={"title": "個人簽約", "parties": P2})
+check("公司欄位可留白（個人簽約）", ok_blank.status_code == 200)
+check("可用公司名稱查詢", requests.get(API + "/contracts/list", headers=HN, params={"q": "台灣大哥大"}).json()["total"] == 1)
+check("可用統編查詢", requests.get(API + "/contracts/list", headers=HN, params={"q": "04595257"}).json()["total"] == 1)
+check("可用代表人查詢", requests.get(API + "/contracts/list", headers=HN, params={"q": "jane doe"}).json()["total"] == 1)
+cidc = rc.json()["contractId"]; tnc = rc.json()["tenantId"]
+inv = requests.post(API + "/signature/invite", headers=HN, json={"tenantId": tnc, "contractId": cidc, "expiresAt": exp}).json()
+for v, nm in zip(inv["invites"], ["王小明", "Jane Doe"]):
+    tk = v["previewUrl"].rsplit("/", 1)[1]
+    pv = requests.get(API + "/signature/invite", params={"token": tk}).json()
+    if nm == "王小明":
+        check("簽署頁看得到公司資料", any(p.get("company") == "台灣大哥大股份有限公司" for p in pv["contract"]["parties"]), str(pv)[:150])
+    requests.post(API + "/signature/action", json={"token": tk, "action": "sign", "name": nm, "consent": True, "signatureImage": PNG})
+pdfr = requests.get(API + f"/contracts/signed-pdf?tenantId={tnc}&contractId={cidc}", headers=HN)
+from pypdf import PdfReader as _PR
+_txt = "".join(pg.extract_text() or "" for pg in _PR(io.BytesIO(pdfr.content)).pages)
+check("已簽署 PDF 含公司名稱、統編、地址、代表人", all(x in _txt for x in ["台灣大哥大股份有限公司", "04595257", "敦化南路", "林之晨", "Acme Corp.", "Jane Doe"]), pdfr.status_code)
 ok = sum(1 for _, p in results if p)
 print(f"\n結果：{ok}/{len(results)} 通過")
 sys.exit(0 if ok == len(results) else 1)

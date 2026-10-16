@@ -172,6 +172,24 @@ def resolve_contract(user: dict, tenant_id: str, contract_id: str = "", contract
     return owned_contract(user, tenant_id, contract_id)
 
 
+def valid_tw_ubn(no: str) -> bool:
+    """台灣統一編號檢查碼（財政部 2023 新制：加權和可被 5 整除；第 7 碼為 7 時加 1 亦可）。"""
+    if not re.fullmatch(r"\d{8}", no):
+        return False
+    weights = [1, 2, 1, 2, 1, 2, 4, 1]
+    total = sum(sum(divmod(int(d) * w, 10)) for d, w in zip(no, weights))
+    return total % 5 == 0 or (no[6] == "7" and (total + 1) % 5 == 0)
+
+
+def clean_company(p: dict) -> dict:
+    """簽署方公司資料（選填）。統編若為 8 位數字依台灣檢查碼驗證；外國公司可填 1–20 碼英數字。"""
+    tax = str(p.get("taxId", "")).strip().upper().replace(" ", "")
+    if tax and (not re.fullmatch(r"[A-Z0-9-]{1,20}", tax) or (re.fullmatch(r"\d{8}", tax) and not valid_tw_ubn(tax))):
+        raise ValueError("invalid_tax_id")
+    return {"company": str(p.get("company", "")).strip()[:120], "taxId": tax,
+            "address": str(p.get("address", "")).strip()[:200], "representative": str(p.get("representative", "")).strip()[:60]}
+
+
 def tx_get(transaction, ref) -> dict:
     """相容新舊版 google-cloud-firestore：transaction.get 可能回傳快照或產生器。"""
     result = transaction.get(ref)
@@ -306,7 +324,7 @@ def h_create_contract(req, payload):
         email = str(p.get("email", "")).strip().lower()
         if "@" not in email:
             raise ValueError("invalid_signer")
-        clean.append({"id": f"signer-{i + 1}", "role": role, "email": email})
+        clean.append({"id": f"signer-{i + 1}", "role": role, "email": email, **clean_company(p)})
     cover = str(payload.get("coverId", "classic-navy"))
     if cover not in COVERS:
         cover = "classic-navy"
@@ -373,7 +391,8 @@ def h_list(req):
         if status and c.get("status") != status:
             continue
         hay = " ".join([str(c.get("contractNo", "")), d.id, c.get("title", ""), c.get("summary", ""),
-                        " ".join(f"{p.get('role', '')} {p.get('email', '')}" for p in c.get("parties", []))]).lower()
+                        " ".join(f"{p.get('role', '')} {p.get('email', '')} {p.get('company', '')} {p.get('taxId', '')} {p.get('representative', '')}"
+                                 for p in c.get("parties", []))]).lower()
         if q and q not in hay:
             continue
         rows.append({"id": d.id, "contractNo": c.get("contractNo") or d.id, "title": c.get("title", ""),
@@ -631,7 +650,7 @@ def api(req: https_fn.Request):
     if req.method == "OPTIONS":
         return response({"ok": True})
     if req.method == "GET" and path.endswith("/health"):
-        return response({"ok": True, "service": "mycontractapp-api", "region": "asia-east1", "version": "2026-10-16b"})
+        return response({"ok": True, "service": "mycontractapp-api", "region": "asia-east1", "version": "2026-10-16c"})
     try:
         payload = req.get_json(silent=True) or {}
         m = req.method
